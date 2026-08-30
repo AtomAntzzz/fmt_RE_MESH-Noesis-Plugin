@@ -1,50 +1,64 @@
-# fmt_RE_MESH-Noesis-Plugin
-A plugin for Rich Whitehouse's Noesis to import and export RE Engine meshes, textures and animations
+# RE Engine Noesis / Maya Tool
 
-## SUPPORTED GAMES
+[中文](./README.md) | [English](./README.en.md)
+
+本仓库将 alphaZomega 的 Noesis RE Engine 资产插件与 AtomAntzzz 的 Maya 动画工作流合并到同一个维护入口。当前仓库不包含 3ds Max MaxScript。
+
+## 文件
+
+- `fmt_RE_MESH.py`：Noesis 插件，用于读取和导出 RE Engine 的 MESH、TEX、MDF/MDF2、MOTLIST 等资产。
+- `REEM_Noesis_Maya.py`：Maya 工具，通过 Noesis 导入 MESH/MOTLIST、读取动画日志并批量切分动画片段。
+
+## 上游 v3.28 列出的游戏
+
 - Resident Evil 2 Remake
 - Resident Evil 3 Remake
 - Resident Evil 4 Remake
-- Resident Evil 7 (Ray Tracing)
+- Resident Evil 7（Ray Tracing）
 - Resident Evil 8
 - Devil May Cry 5
 - Monster Hunter Rise
 - Street Fighter 6
-- ExoPrimal
+- Exoprimal
 - Apollo Justice: Ace Attorney Trilogy
 - Dragon's Dogma 2
 
+该列表沿用 alphaZomega v3.28 的公开说明，不代表尚未完成样本回归的新游戏已经得到支持。PRAGMATA、Resident Evil 9 和 Monster Hunter Wilds 不在本仓库当前已验证支持声明中。
 
-## INSTALLATION:
-Download Noesis from here: https://www.richwhitehouse.com/index.php?content=inc_projects.php&showproject=91
-Once it is installed, navigate to your [Noesis Installation Path]/plugins/python folder and put fmt_RE_MESH.py in there, and re-launch the program.
-Opening a mesh or tex file with Noesis will automatically load it, once the plugin is installed. 
+## 安装 Noesis 插件
 
+1. 从 [Noesis 官方页面](https://www.richwhitehouse.com/index.php?content=inc_projects.php&showproject=91)下载并安装 Noesis。
+2. 将 `fmt_RE_MESH.py` 放入 `[Noesis 安装目录]/plugins/python/`。
+3. 重启 Noesis。打开受支持的 `.mesh.*`、`.tex.*` 或 `.motlist.*` 文件时，插件会自动参与识别。
 
-## NOESIS MAXSCRIPT:
-To use the optional Noesis Maxscript (REEM Noesis CMD), you should edit the included .ms file to tell it where your Noesis.exe is. 
-Then you can run the maxscript in 3dsMax with Scripts -> Run Script, and use it to remote-control Noesis as to seamlessly import and export with a GUI inside 3dsmax.
+Noesis 的 MESH 选择窗口可以双击加入同目录相关 MESH，再通过 **Load** 一起载入模型、骨架、材质和纹理。MOTLIST 动画通常选择列表顶部的 `[ALL]` 集合，以便一次导出全部动画。
 
+## 安装 Maya 工具
 
-### Tips
-- The plugin supports opening RE Engine SCN files. These files can contain a list of meshes at certain positions, constituting a stage or map
-- The plugin saves the location of your extracted re_chunk_000.pak folder ("Base Directory") for each game in a txt file next to the plugin. Edit this file if it is not correct
-- In the mesh/animation import window, double click ".." to go up a parent directory, or paste in a directory into the text box to go there
-- You can load multiple meshes together in addition to the mesh you first selected. They and their bones will be merged together into the same model
-- When loading a mesh, click the "Select Animation" button to load motlist animations with it, useful for quickly testing rigging
-- You can export an animation with the Noesis `-fbxmultitake` advanced option to separate the animations onto different tracks. Then find the Blender FBX import plugin, open the `io_scene_fbx` folder, locate the `import_fbx.py` find the `# Compute framerate settings section`, change its 25fps to 1, and save. Then change the frame rate from 1 to 60 after importing to Blender
+1. 在 Maya 打开 **窗口 → 常规编辑器 → 脚本编辑器**。
+2. 在脚本编辑器使用 **文件 → 打开脚本**，选择 `REEM_Noesis_Maya.py`。
+3. 使用 **文件 → 将脚本保存至工具架**。
+4. 打开 REEM 工具，通过 **Browse** 选择 Noesis 可执行文件。
 
-### For more info on REEM, check out this guide:
-https://residentevilmodding.boards.net/thread/15374/noesis-maxscript-custom-physics-guide
+## Maya 动画工作流
 
+1. 在 REEM 中选择 `.mesh.*` 或 `.motlist.*`。
+2. 对 MOTLIST，在 Noesis 选择窗口双击 `[ALL]`，再点击 **Load**。
+3. Maya 导入完成后，工具从 Noesis 日志填充 **Animation List**。
+4. 使用 **Export Selected Animations** 或 **Export All Animations** 按片段导出。
 
-### More Info on the plugin:
-https://residentevilmodding.boards.net/thread/13501/exporting-custom-models-dmc5-noesis
+Noesis 某些无法正确解析的动画可能只产生第一帧，却在日志中保留完整帧数。工具会剔除明确 Warning、把 0 帧和 `blend_pose` 修正为 1 帧；其余异常可通过 **Manually Paste Noesis List** 手工把对应 `frames` 改为 1。此类异常动画进入 Unreal Engine 前仍需单独检查。
 
+## Windows UTF-8 兼容性
 
-### Credits
-Thanks to Gh0stblade for creating the original version of this plugin in 2019
+`REEM_Noesis_Maya.py` 会在隐藏的 CP936 控制台中启动 Noesis，以兼容 Noesis 4.474 的嵌入式 Python 插件加载器。即使 Windows 开启“Beta 版：使用 Unicode UTF-8 提供全球语言支持”，命令行导出也不应再因为插件未加载而显示 `Detected file type: Unknown`。
 
+该处理只影响 REEM 创建的 Noesis 子进程，不会修改 Windows 系统区域设置；MESH 关联文件和 MOTLIST `[ALL]` 的交互式选择窗口保持可用。
 
-### Support
-If you have issues with the plugin, create an issue here or join [Modding Haven](https://discord.gg/acCRqRyUB2) and message me on Discord
+## 来源与说明
+
+- Noesis 插件来源：[alphazolam/fmt_RE_MESH-Noesis-Plugin](https://github.com/alphazolam/fmt_RE_MESH-Noesis-Plugin)
+- Maya 工具原仓库：[AtomAntzzz/RE-Engine-Mesh-Animtion-Noesis-Tool](https://github.com/AtomAntzzz/RE-Engine-Mesh-Animtion-Noesis-Tool)
+- Maya 工作流补充说明：[知乎文章](https://zhuanlan.zhihu.com/p/685480151)
+
+来源、历史合并和权利状态见 [NOTICE.md](./NOTICE.md)。
