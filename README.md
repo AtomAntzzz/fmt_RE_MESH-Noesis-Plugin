@@ -23,7 +23,18 @@
 - Apollo Justice: Ace Attorney Trilogy
 - Dragon's Dogma 2
 
-该列表沿用 alphaZomega v3.28 的公开说明，不代表尚未完成样本回归的新游戏已经得到支持。PRAGMATA、Resident Evil 9 和 Monster Hunter Wilds 不在本仓库当前已验证支持声明中。
+该列表沿用 alphaZomega v3.28 的公开说明，不代表尚未完成样本回归的新游戏已经得到支持。Resident Evil 9 和 Monster Hunter Wilds 不在本仓库当前已验证支持声明中；PRAGMATA 只具有下述严格限定的单 profile 支持。
+
+## PRAGMATA 限定支持
+
+当前只支持一个已观察样本的 candidate 002 exact MESH profile：外部后缀 `.mesh.251121828`、内部版本 `250707828`、ordinary standalone、non-MPLY、skinned、单 LOD / 单 group / 单 submesh；冻结样本 SHA-256 为 `78001dd7dd85da34434e48ae4a9426ba71d023d54dab30f3c490f69471fa4068`。
+
+- 该 exact profile 的只读导入为 `readable`，Noesis 中的纯几何预览为 `previewable`。
+- GUI 验证计数为 `Models 1 / Meshes 1 / Textures 0 / Materials 0 / Bones 229`；零纹理/材质表示材质化预览尚未支持，骨骼/权重视觉正确性也未验证。
+- candidate 001、其他 `.251121828` 结构、multi-LOD、multi-material、streaming、MPLY、TEX/MDF2/MOTLIST、导出、独立重新导入和游戏运行时均不在该声明中。
+- 插件对不符合上述结构不变量的同后缀文件会关闭该能力，不能把这个单样本 profile 理解为整个 PRAGMATA 格式族已获支持。
+
+仓库不包含 PRAGMATA 商业样本、文件名列表、提取清单或 GUI 证据文件。
 
 ## 安装 Noesis 插件
 

@@ -82,12 +82,569 @@ iListboxSize  				= 280					#The height of the list box in the plugin's import m
 
 from inc_noesis import *
 from collections import namedtuple
+import hashlib
+import json
+import struct
 import noewin
 import math
 import os
 import re
 import copy
 import time
+
+MeshCapability = namedtuple("MeshCapability", (
+	"key", "internal_version", "header_layout",
+	"mesh_buffer_layout", "submesh_layout", "bone_index_layout",
+))
+
+
+class MeshProfileError(Exception):
+	pass
+
+
+PRAGMATA_MESH_CAPABILITY_KEY = "pragmata-250707828-ordinary-skinned-v1"
+
+
+PRAGMATA_250707828 = MeshCapability(
+	PRAGMATA_MESH_CAPABILITY_KEY,
+	250707828,
+	"late-176",
+	"late-two-u64-96",
+	"dr32",
+	"six-u10",
+)
+
+
+PRAGMATA_HEADER_FIELDS = (
+	("vertices_offset", 0x28),
+	("lod_offset", 0x30),
+	("mesh_offset", 0x58),
+	("aabb_offset", 0x70),
+	("skeleton_offset", 0x78),
+	("material_remap_offset", 0x80),
+	("bone_remap_offset", 0x88),
+	("blend_name_offset", 0x90),
+	("names_offset", 0x98),
+	("streaming_offset", 0xA0),
+)
+
+
+PRAGMATA_MESH_RANGE_LABELS = (
+	"mesh-header",
+	"vertex-elements",
+	"vertex-buffer",
+	"face-buffer",
+)
+
+
+def _detectPragmataIdentity(data, path):
+	lower_path = path.lower()
+	if not lower_path.endswith(".251121828"):
+		return None
+	if len(data) < 0xB0:
+		raise MeshProfileError("truncated-late-header")
+	if data[0:4] != b"MESH":
+		raise MeshProfileError("mesh-magic-mismatch")
+	if struct.unpack_from("<I", data, 4)[0] != 250707828:
+		raise MeshProfileError("internal-version-mismatch")
+	if struct.unpack_from("<I", data, 8)[0] != len(data):
+		raise MeshProfileError("declared-size-mismatch")
+	return PRAGMATA_250707828
+
+
+def _readMeshScalar(data, offset, fmt, label):
+	size = struct.calcsize(fmt)
+	if offset < 0 or offset + size > len(data):
+		raise MeshProfileError("offset-out-of-bounds:" + label)
+	return struct.unpack_from(fmt, data, offset)[0]
+
+
+def _checkedRange(data, start, size, label):
+	end = start + size
+	if start < 0 or size < 0 or end < start or end > len(data):
+		raise MeshProfileError("offset-out-of-bounds:" + label)
+	return (start, end)
+
+
+def _validatePragmataBoneMapCount(bone_map_count):
+	if isinstance(bone_map_count, bool) or not isinstance(bone_map_count, int) or bone_map_count <= 0 or bone_map_count > 1024:
+		raise MeshProfileError("structural-profile-mismatch:bone-map-count")
+	return bone_map_count
+
+
+def decodeSixU10(value, bone_map_count):
+	bone_map_count = _validatePragmataBoneMapCount(bone_map_count)
+	if ((value >> 30) & 3) != 3 or ((value >> 62) & 3) != 3:
+		raise MeshProfileError("invalid-six-u10-separator")
+	indices = (
+		value & 0x3FF,
+		(value >> 10) & 0x3FF,
+		(value >> 20) & 0x3FF,
+		(value >> 32) & 0x3FF,
+		(value >> 42) & 0x3FF,
+		(value >> 52) & 0x3FF,
+	)
+	if any(index >= bone_map_count for index in indices):
+		raise MeshProfileError("bone-index-out-of-range")
+	return indices
+
+
+def parsePragmataSubmesh(data, offset):
+	_checkedRange(data, offset, 32, "submesh-record")
+	values = struct.unpack_from("<BBBBIIIIIII", data, offset)
+	return {
+		"material_index": values[0],
+		"index_count": values[5],
+		"index_start": values[6],
+		"vertex_start": values[7],
+		"streaming_offset": values[8],
+		"platform_streaming_offset": values[9],
+	}
+
+
+def _validatePragmataWeights(weight_elements, bone_map_count):
+	if len(weight_elements) % 16:
+		raise MeshProfileError("structural-profile-mismatch:weight-stride")
+	bone_map_count = _validatePragmataBoneMapCount(bone_map_count)
+	weighted_vertices = 0
+	weighted_bones = set()
+	max_influences = 0
+	max_error = 0.0
+	for offset in range(0, len(weight_elements), 16):
+		indices = decodeSixU10(
+			struct.unpack_from("<Q", weight_elements, offset)[0], bone_map_count
+		)
+		weights = struct.unpack_from("8B", weight_elements, offset + 8)
+		if weights[6] != 0 or weights[7] != 0:
+			raise MeshProfileError("unsupported-extra-weight-profile")
+		active = [index for index, weight in zip(indices, weights[:6]) if weight != 0]
+		if active:
+			weighted_vertices += 1
+			weighted_bones.update(active)
+			max_influences = max(max_influences, len(active))
+			max_error = max(max_error, abs(sum(weights[:6]) / 255.0 - 1.0))
+	return {
+		"weighted_vertex_count": weighted_vertices,
+		"weighted_bone_count": len(weighted_bones),
+		"max_influences": max_influences,
+		"weight_sum_max_error": max_error,
+	}
+
+
+def _rangesOverlap(left, right):
+	return left[0] < right[1] and right[0] < left[1]
+
+
+def parsePragmataMeshBufferHeader(data, mesh_offset):
+	mesh_range = _checkedRange(data, mesh_offset, 96, "mesh-header")
+	values = struct.unpack_from("<QQQIIHHQQIIhhQQQQ", data, mesh_offset)
+	vertex_element_offset = values[0]
+	vertex_buffer_offset = values[1]
+	total_buffer_size = values[3]
+	vertex_buffer_size = values[4]
+	main_element_count = values[5]
+	element_count = values[6]
+	extra_offset0 = values[7]
+	extra_offset1 = values[8]
+	block2_face_offset = values[9]
+	if vertex_element_offset != mesh_offset + 96:
+		raise MeshProfileError("structural-profile-mismatch:vertex-elements-96")
+	if main_element_count == 0 or element_count == 0 or main_element_count > element_count:
+		raise MeshProfileError("structural-profile-mismatch:vertex-element-count")
+	for label, value in (("mesh-extra-0", extra_offset0), ("mesh-extra-1", extra_offset1)):
+		if value != 0 and value >= len(data):
+			raise MeshProfileError("offset-out-of-bounds:" + label)
+	if vertex_buffer_size == 0:
+		raise MeshProfileError("structural-profile-mismatch:vertex-buffer-size")
+	if block2_face_offset <= vertex_buffer_size or total_buffer_size < block2_face_offset:
+		raise MeshProfileError("structural-profile-mismatch:face-buffer-size")
+	face_buffer_offset = vertex_buffer_offset + vertex_buffer_size
+	face_buffer_size = block2_face_offset - vertex_buffer_size
+	ranges = {
+		"mesh-header": mesh_range,
+		"vertex-elements": _checkedRange(data, vertex_element_offset, element_count * 8, "vertex-elements"),
+		"vertex-buffer": _checkedRange(data, vertex_buffer_offset, vertex_buffer_size, "vertex-buffer"),
+		"face-buffer": _checkedRange(data, face_buffer_offset, face_buffer_size, "face-buffer"),
+	}
+	total_buffer_range = _checkedRange(data, vertex_buffer_offset, total_buffer_size, "total-buffer")
+	for left_index in range(len(PRAGMATA_MESH_RANGE_LABELS)):
+		for right_index in range(left_index + 1, len(PRAGMATA_MESH_RANGE_LABELS)):
+			left = PRAGMATA_MESH_RANGE_LABELS[left_index]
+			right = PRAGMATA_MESH_RANGE_LABELS[right_index]
+			if _rangesOverlap(ranges[left], ranges[right]):
+				raise MeshProfileError("range-overlap:" + left + ":" + right)
+	return {
+		"vertex_element_offset": vertex_element_offset,
+		"vertex_buffer_offset": vertex_buffer_offset,
+		"vertex_buffer_size": vertex_buffer_size,
+		"vertex_buffer_range": ranges["vertex-buffer"],
+		"total_buffer_range": total_buffer_range,
+		"face_buffer_offset": face_buffer_offset,
+		"face_buffer_size": face_buffer_size,
+		"face_buffer_range": ranges["face-buffer"],
+		"main_element_count": main_element_count,
+		"element_count": element_count,
+	}
+
+
+def parsePragmataHeader(data, path):
+	capability = _detectPragmataIdentity(data, path)
+	if capability is None:
+		raise MeshProfileError("unsupported-mesh-profile")
+	header = {
+		"capability": capability,
+		"name_count": _readMeshScalar(data, 0x14, "<H", "name_count"),
+	}
+	if header["name_count"] == 0:
+		raise MeshProfileError("structural-profile-mismatch:name-count")
+	for label, offset in PRAGMATA_HEADER_FIELDS:
+		value = _readMeshScalar(data, offset, "<Q", label)
+		if label != "blend_name_offset" and (value <= 0 or value >= len(data)):
+			raise MeshProfileError("offset-out-of-bounds:" + label)
+		header[label] = value
+	if header["blend_name_offset"] != 0:
+		raise MeshProfileError("unsupported-blend-shape-profile")
+	if header["names_offset"] + header["name_count"] * 8 > len(data):
+		raise MeshProfileError("offset-out-of-bounds:name-table")
+	if _readMeshScalar(data, header["streaming_offset"], "<I", "streaming-entry-count") != 0:
+		raise MeshProfileError("streaming-profile-out-of-scope")
+	header["mesh_buffer"] = parsePragmataMeshBufferHeader(data, header["mesh_offset"])
+	if header["vertices_offset"] != header["mesh_buffer"]["vertex_buffer_offset"]:
+		raise MeshProfileError("structural-profile-mismatch:vertices-offset")
+	return header
+
+
+def _pragmataTopologyHash(positions, indices):
+	if len(indices) % 3:
+		raise MeshProfileError("structural-profile-mismatch:index-count")
+	triangles = []
+	for start in range(0, len(indices), 3):
+		triangle = []
+		for index in indices[start:start + 3]:
+			if index < 0 or index >= len(positions):
+				raise MeshProfileError("index-out-of-range")
+			rounded = [round(float(value), 6) for value in positions[index]]
+			if any(not math.isfinite(value) for value in rounded):
+				raise MeshProfileError("structural-profile-mismatch:non-finite-position")
+			triangle.append([0.0 if value == 0.0 else value for value in rounded])
+		triangles.append(sorted(triangle))
+	payload = json.dumps(sorted(triangles), sort_keys=True, separators=(",", ":"))
+	return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _readPragmataCString(data, offset, label):
+	_checkedRange(data, offset, 1, label)
+	end = data.find(b"\0", offset)
+	if end == -1:
+		raise MeshProfileError("offset-out-of-bounds:" + label)
+	try:
+		return bytes(data[offset:end]).decode("utf-8")
+	except UnicodeDecodeError:
+		raise MeshProfileError("structural-profile-mismatch:" + label)
+
+
+def _newPragmataImportStats(capability):
+	return {
+		"schema": "noesis-mesh-stats/v1",
+		"capability": capability.key,
+		"lod_count": 0,
+		"group_count": 0,
+		"submesh_count": 0,
+		"vertex_count": 0,
+		"index_count": 0,
+		"triangle_count": 0,
+		"normal_count": 0,
+		"tangent_count": 0,
+		"uv_count": 0,
+		"color_count": 0,
+		"material_binding_count": 0,
+		"bone_count": 0,
+		"weighted_bone_count": 0,
+		"weighted_vertex_count": 0,
+		"max_influences": 0,
+		"weight_sum_max_error": 0.0,
+		"aabb": None,
+		"topology_hash": None,
+	}
+
+
+def _parsePragmataMeshData(data, header):
+	capability = header.get("capability")
+	if capability != PRAGMATA_250707828:
+		raise MeshProfileError("unsupported-mesh-profile")
+	stats = _newPragmataImportStats(capability)
+
+	lod_offset = header["lod_offset"]
+	_checkedRange(data, lod_offset, 16, "lod-header")
+	count_array = struct.unpack_from("16B", data, lod_offset)
+	lod_count = count_array[0]
+	material_count = count_array[1]
+	if lod_count != 1:
+		raise MeshProfileError("structural-profile-mismatch:lod-count")
+	if material_count <= 0:
+		raise MeshProfileError("structural-profile-mismatch:material-count")
+	if count_array[6] != 0:
+		raise MeshProfileError("structural-profile-mismatch:index-width")
+	lod_table_offset = lod_offset + 64
+	_checkedRange(data, lod_table_offset, lod_count * 8, "lod-offset-table")
+
+	groups = []
+	submeshes = []
+	for lod_index in range(lod_count):
+		lod_record_offset = struct.unpack_from("<Q", data, lod_table_offset + lod_index * 8)[0]
+		_checkedRange(data, lod_record_offset, 16, "lod-record")
+		group_count = data[lod_record_offset]
+		if group_count != 1:
+			raise MeshProfileError("structural-profile-mismatch:group-count")
+		group_table_offset = struct.unpack_from("<Q", data, lod_record_offset + 8)[0]
+		_checkedRange(data, group_table_offset, group_count * 8, "group-offset-table")
+		for group_index in range(group_count):
+			group_offset = struct.unpack_from("<Q", data, group_table_offset + group_index * 8)[0]
+			_checkedRange(data, group_offset, 16, "group-record")
+			group_values = struct.unpack_from("<BBHIII", data, group_offset)
+			group_id = group_values[0]
+			submesh_count = group_values[1]
+			group_vertex_count = group_values[4]
+			group_index_count = group_values[5]
+			if submesh_count != 1:
+				raise MeshProfileError("structural-profile-mismatch:submesh-count")
+			if group_vertex_count <= 0:
+				raise MeshProfileError("structural-profile-mismatch:vertex-count")
+			if group_index_count <= 0 or group_index_count % 3:
+				raise MeshProfileError("structural-profile-mismatch:index-count")
+			_checkedRange(data, group_offset + 16, submesh_count * 32, "submesh-table")
+			group_submeshes = []
+			for submesh_index in range(submesh_count):
+				submesh = parsePragmataSubmesh(data, group_offset + 16 + submesh_index * 32)
+				if submesh["streaming_offset"] != 0 or submesh["platform_streaming_offset"] != 0:
+					raise MeshProfileError("streaming-profile-out-of-scope")
+				if submesh["material_index"] >= material_count:
+					raise MeshProfileError("material-index-out-of-range")
+				if submesh["vertex_start"] != 0:
+					raise MeshProfileError("structural-profile-mismatch:vertex-start")
+				if submesh["index_start"] != 0:
+					raise MeshProfileError("structural-profile-mismatch:index-start")
+				submesh["lod_index"] = lod_index
+				submesh["group_index"] = group_index
+				submesh["group_id"] = group_id
+				submesh["submesh_index"] = submesh_index
+				submesh["vertex_count"] = group_vertex_count
+				group_submeshes.append(submesh)
+				submeshes.append(submesh)
+			if sum(item["index_count"] for item in group_submeshes) != group_index_count:
+				raise MeshProfileError("structural-profile-mismatch:group-index-count")
+			groups.append({
+				"lod_index": lod_index,
+				"group_index": group_index,
+				"group_id": group_id,
+				"vertex_count": group_vertex_count,
+				"index_count": group_index_count,
+			})
+
+	vertex_count = sum(group["vertex_count"] for group in groups)
+	index_count = sum(submesh["index_count"] for submesh in submeshes)
+	if vertex_count <= 0 or index_count <= 0:
+		raise MeshProfileError("structural-profile-mismatch:empty-mesh")
+
+	name_count = header["name_count"]
+	name_table_offset = header["names_offset"]
+	_checkedRange(data, name_table_offset, name_count * 8, "name-table")
+	names = []
+	for name_index in range(name_count):
+		name_offset = struct.unpack_from("<Q", data, name_table_offset + name_index * 8)[0]
+		name = _readPragmataCString(data, name_offset, "name-string")
+		if not name:
+			raise MeshProfileError("structural-profile-mismatch:empty-name")
+		names.append(name)
+
+	material_remap_offset = header["material_remap_offset"]
+	_checkedRange(data, material_remap_offset, material_count * 2, "material-remap")
+	material_names = []
+	for material_index in range(material_count):
+		name_index = struct.unpack_from("<H", data, material_remap_offset + material_index * 2)[0]
+		if name_index >= name_count:
+			raise MeshProfileError("name-index-out-of-range:material")
+		material_names.append(names[name_index])
+
+	skeleton_offset = header["skeleton_offset"]
+	_checkedRange(data, skeleton_offset, 48, "skeleton-header")
+	bone_count, bone_map_count = struct.unpack_from("<II", data, skeleton_offset)
+	if bone_count <= 0:
+		raise MeshProfileError("structural-profile-mismatch:bone-count")
+	_validatePragmataBoneMapCount(bone_map_count)
+	hierarchy_offset, local_offset, global_offset, inverse_global_offset = struct.unpack_from(
+		"<QQQQ", data, skeleton_offset + 16)
+	for label, offset, size in (
+		("bone-hierarchy", hierarchy_offset, bone_count * 16),
+		("bone-local-matrices", local_offset, bone_count * 64),
+		("bone-global-matrices", global_offset, bone_count * 64),
+		("bone-inverse-global-matrices", inverse_global_offset, bone_count * 64),
+	):
+		if offset <= 0:
+			raise MeshProfileError("offset-out-of-bounds:" + label)
+		_checkedRange(data, offset, size, label)
+
+	bone_map_offset = skeleton_offset + 48
+	_checkedRange(data, bone_map_offset, bone_map_count * 2, "bone-map")
+	bone_map = []
+	for map_index in range(bone_map_count):
+		bone_index = struct.unpack_from("<h", data, bone_map_offset + map_index * 2)[0]
+		if bone_index < 0 or bone_index >= bone_count:
+			raise MeshProfileError("bone-map-index-out-of-range")
+		bone_map.append(bone_index)
+
+	bone_name_remap_offset = header["bone_remap_offset"]
+	_checkedRange(data, bone_name_remap_offset, bone_count * 2, "bone-name-remap")
+	bone_name_indices = []
+	for bone_index in range(bone_count):
+		name_index = struct.unpack_from("<H", data, bone_name_remap_offset + bone_index * 2)[0]
+		if name_index >= name_count:
+			raise MeshProfileError("name-index-out-of-range:bone")
+		bone_name_indices.append(name_index)
+
+	bones = []
+	seen_bone_indices = set()
+	for bone_index in range(bone_count):
+		hierarchy = struct.unpack_from("<8h", data, hierarchy_offset + bone_index * 16)
+		declared_index = hierarchy[0]
+		parent_index = hierarchy[1]
+		if declared_index < 0 or declared_index >= bone_count or declared_index in seen_bone_indices:
+			raise MeshProfileError("bone-index-out-of-range")
+		if parent_index < -1 or parent_index >= bone_count:
+			raise MeshProfileError("bone-parent-index-out-of-range")
+		seen_bone_indices.add(declared_index)
+		matrix_offset = local_offset + bone_index * 64
+		matrix_values = struct.unpack_from("<16f", data, matrix_offset)
+		if any(not math.isfinite(value) for value in matrix_values):
+			raise MeshProfileError("structural-profile-mismatch:non-finite-bone-matrix")
+		bones.append({
+			"index": declared_index,
+			"parent_index": parent_index,
+			"name": names[bone_name_indices[bone_index]],
+			"local_matrix": bytes(data[matrix_offset:matrix_offset + 64]),
+		})
+
+	mesh_buffer = header["mesh_buffer"]
+	if mesh_buffer["main_element_count"] != 5 or mesh_buffer["element_count"] != 5:
+		raise MeshProfileError("structural-profile-mismatch:vertex-element-count")
+	vertex_elements = {}
+	element_types = []
+	for element_index in range(mesh_buffer["element_count"]):
+		element_offset = mesh_buffer["vertex_element_offset"] + element_index * 8
+		element_type, stride, buffer_offset = struct.unpack_from("<HHI", data, element_offset)
+		if element_type in vertex_elements:
+			raise MeshProfileError("structural-profile-mismatch:duplicate-vertex-element")
+		vertex_elements[element_type] = {
+			"type": element_type,
+			"stride": stride,
+			"offset": buffer_offset,
+		}
+		element_types.append(element_type)
+	if tuple(element_types) != (0, 1, 2, 4, 5):
+		raise MeshProfileError("structural-profile-mismatch:vertex-elements")
+	for element_type, expected_stride in ((0, 12), (1, 8), (2, 4), (4, 16), (5, 4)):
+		element = vertex_elements[element_type]
+		if element["stride"] != expected_stride:
+			raise MeshProfileError("structural-profile-mismatch:vertex-stride")
+		start = mesh_buffer["vertex_buffer_offset"] + element["offset"]
+		size = element["stride"] * vertex_count
+		if element["offset"] + size > mesh_buffer["vertex_buffer_size"]:
+			raise MeshProfileError("offset-out-of-bounds:vertex-element-" + str(element_type))
+		element["range"] = _checkedRange(data, start, size, "vertex-element-" + str(element_type))
+	element_labels = (0, 1, 2, 4, 5)
+	for left_index in range(len(element_labels)):
+		for right_index in range(left_index + 1, len(element_labels)):
+			left = element_labels[left_index]
+			right = element_labels[right_index]
+			if _rangesOverlap(vertex_elements[left]["range"], vertex_elements[right]["range"]):
+				raise MeshProfileError("range-overlap:vertex-element-" + str(left) + ":vertex-element-" + str(right))
+
+	positions = []
+	position_start = vertex_elements[0]["range"][0]
+	for vertex_index in range(vertex_count):
+		position = struct.unpack_from("<3f", data, position_start + vertex_index * 12)
+		if any(not math.isfinite(value) for value in position):
+			raise MeshProfileError("structural-profile-mismatch:non-finite-position")
+		positions.append(position)
+
+	weight_range = vertex_elements[4]["range"]
+	weight_data = bytes(data[weight_range[0]:weight_range[1]])
+	weight_stats = _validatePragmataWeights(weight_data, bone_map_count)
+	bone_indices = []
+	for vertex_index in range(vertex_count):
+		bone_indices.append(decodeSixU10(
+			struct.unpack_from("<Q", weight_data, vertex_index * 16)[0], bone_map_count
+		))
+
+	face_buffer_size = mesh_buffer["face_buffer_size"]
+	if face_buffer_size % 2:
+		raise MeshProfileError("structural-profile-mismatch:face-buffer-size")
+	face_index_capacity = face_buffer_size // 2
+	indices = []
+	for submesh in submeshes:
+		if submesh["index_count"] % 3:
+			raise MeshProfileError("structural-profile-mismatch:index-count")
+		if submesh["index_start"] + submesh["index_count"] > face_index_capacity:
+			raise MeshProfileError("offset-out-of-bounds:index-buffer")
+		index_buffer_offset = mesh_buffer["face_buffer_offset"] + submesh["index_start"] * 2
+		index_buffer_size = submesh["index_count"] * 2
+		_checkedRange(data, index_buffer_offset, index_buffer_size, "index-buffer")
+		submesh_indices = []
+		for index_number in range(submesh["index_count"]):
+			index = struct.unpack_from("<H", data, index_buffer_offset + index_number * 2)[0]
+			if index >= submesh["vertex_count"]:
+				raise MeshProfileError("index-out-of-range")
+			submesh_indices.append(index + submesh["vertex_start"])
+		indices.extend(submesh_indices)
+		submesh["indices"] = submesh_indices
+		submesh["index_buffer"] = bytes(data[index_buffer_offset:index_buffer_offset + index_buffer_size])
+	if index_count * 2 != face_buffer_size:
+		raise MeshProfileError("structural-profile-mismatch:face-buffer-size")
+
+	mins = [min(position[axis] for position in positions) for axis in range(3)]
+	maxs = [max(position[axis] for position in positions) for axis in range(3)]
+	stats.update({
+		"lod_count": lod_count,
+		"group_count": len(groups),
+		"submesh_count": len(submeshes),
+		"vertex_count": vertex_count,
+		"index_count": index_count,
+		"triangle_count": index_count // 3,
+		"normal_count": vertex_count,
+		"tangent_count": vertex_count,
+		"uv_count": vertex_count,
+		"color_count": vertex_count,
+		"material_binding_count": len(submeshes),
+		"bone_count": bone_count,
+		"weighted_bone_count": weight_stats["weighted_bone_count"],
+		"weighted_vertex_count": weight_stats["weighted_vertex_count"],
+		"max_influences": weight_stats["max_influences"],
+		"weight_sum_max_error": weight_stats["weight_sum_max_error"],
+		"aabb": {"min": mins, "max": maxs},
+		"topology_hash": _pragmataTopologyHash(positions, indices),
+	})
+	return {
+		"stats": stats,
+		"positions": positions,
+		"indices": indices,
+		"groups": groups,
+		"submeshes": submeshes,
+		"vertex_buffer": bytes(data[mesh_buffer["vertex_buffer_range"][0]:mesh_buffer["vertex_buffer_range"][1]]),
+		"vertex_elements": vertex_elements,
+		"bone_indices": bone_indices,
+		"bone_map": bone_map,
+		"bones": bones,
+		"material_names": material_names,
+	}
+
+
+def detectMeshCapability(data, path):
+	capability = _detectPragmataIdentity(data, path)
+	if capability is None:
+		return None
+	header = parsePragmataHeader(data, path)
+	_parsePragmataMeshData(data, header)
+	return capability
 
 def registerNoesisTypes():
 
@@ -103,7 +660,7 @@ def registerNoesisTypes():
 		noesis.addOption(handle, "-vfx", "Export as VFX mesh", 0)
 		return handle
 		
-	handle = noesis.register("RE Engine MESH [PC]", ".1902042334;.1808312334;.1808282334;.2008058288;.2102020001;.2101050001;.2109108288;.2109148288;.220128762;.220301866;.220721329;.221108797;.220907984;.230110883;.230612127;.231011879;.240424828;.NewMesh")
+	handle = noesis.register("RE Engine MESH [PC]", ".1902042334;.1808312334;.1808282334;.2008058288;.2102020001;.2101050001;.2109108288;.2109148288;.220128762;.220301866;.220721329;.221108797;.220907984;.230110883;.230612127;.231011879;.240424828;.251121828;.NewMesh")
 	noesis.setHandlerTypeCheck(handle, meshCheckType)
 	noesis.setHandlerLoadModel(handle, meshLoadModel)
 	noesis.addOption(handle, "-noprompt", "Do not prompt for MDF file", 0)
@@ -295,6 +852,7 @@ formats = {
 	"AJ_AAT": 		{ "modelExt": ".230612127",  "texExt": ".719230324", "mmtrExt": ".230815080",  "nDir": "stm", "mdfExt": ".mdf2.37", "meshVersion": 3, "mdfVersion": 4, "mlistExt": ".750", "meshMagic":230406984, "motionIDsData":[72,8] },
 	"DD2": 			{ "modelExt": ".231011879",  "texExt": ".760230703", "mmtrExt": ".230815080",  "nDir": "stm", "mdfExt": ".mdf2.40", "meshVersion": 3, "mdfVersion": 4, "mlistExt": ".751", "meshMagic":230517984, "motionIDsData":[72,8] },
 	"DRDR": 		{ "modelExt": ".240424828",  "texExt": ".240606151", "mmtrExt": ".240405143",  "nDir": "stm", "mdfExt": ".mdf2.40", "meshVersion": 3, "mdfVersion": 4, "mlistExt": ".854", "meshMagic":240423829, "motionIDsData":[72,8] },
+	"PRAGMATA": 	{ "modelExt": ".251121828",  "texExt": "",             "mmtrExt": "",            "nDir": "stm", "mdfExt": "",         "meshVersion": 3, "mdfVersion": 0, "mlistExt": "",     "meshMagic":250707828, "motionIDsData":[72,8] },
 }
 
 extToFormat = { #incomplete, just testing
@@ -577,6 +1135,14 @@ def sort_human(List):
 	return sorted(List, key=lambda mesh: [convert(c) for c in re.split('([-+]?[0-9]*\.?[0-9]*)', mesh.name)])
 
 def meshCheckType(data):
+	input_name = rapi.getInputName()
+	if input_name.lower().endswith(".251121828"):
+		try:
+			detectMeshCapability(data, input_name)
+			return 1
+		except MeshProfileError as error:
+			print("RE_MESH_PROFILE_ERROR:" + str(error))
+			return 0
 	bs = NoeBitStream(data)
 	magic = bs.readUInt()
 	
@@ -1393,7 +1959,7 @@ dialogOptions = DialogOptions()
 
 DoubleClickTimer = namedtuple("DoubleClickTimer", "name idx timer")
 
-gamesList = [ "RE7", "RE7RT", "RE2", "RERT", "RE3", "RE4", "RE8", "MHRSunbreak", "DMC5", "SF6", "ReVerse", "ExoPrimal", "AJ_AAT", "DD2", "DRDR" ]
+gamesList = [ "RE7", "RE7RT", "RE2", "RERT", "RE3", "RE4", "RE8", "MHRSunbreak", "DMC5", "SF6", "ReVerse", "ExoPrimal", "AJ_AAT", "DD2", "DRDR", "PRAGMATA" ]
 fullGameNames = [
 	"Resident Evil 7",
 	"Resident Evil 7 RT",
@@ -1410,6 +1976,7 @@ fullGameNames = [
 	"Apollo Justice AAT",
 	"Dragon's Dogma 2",
 	"Dead Rising DR",
+	"Pragmata",
 ]
 		
 class openOptionsDialogImportWindow:
@@ -3005,7 +3572,11 @@ class meshFile(object):
 
 	def __init__(self, data, path=""):
 		self.path = path or rapi.getInputName()
+		self.data = data
 		self.inFile = NoeBitStream(data)
+		self.capability = detectMeshCapability(data, self.path)
+		self.profileHeader = parsePragmataHeader(data, self.path) if self.capability else None
+		self.importStats = None
 		self.boneList = []
 		self.matNames = []
 		self.groupIDs = []
@@ -3035,6 +3606,10 @@ class meshFile(object):
 	def setGameName(self):
 		global sGameName, bSkinningEnabled, isMeshVer3
 		sGameName = "RE2"
+		if self.capability == PRAGMATA_250707828:
+			isMeshVer3 = True
+			sGameName = "PRAGMATA"
+			return
 		meshVersion = readUIntAt(self.inFile, 4)
 		isMeshVer3 = False
 		if meshVersion == 220822879:
@@ -3633,9 +4208,113 @@ class meshFile(object):
 		return True
 		
 	'''MESH IMPORT ========================================================================================================================================================================'''
+	def _loadPragmataMeshFile(self):
+		parsed = _parsePragmataMeshData(self.data, self.profileHeader)
+		vertex_buffer = parsed["vertex_buffer"]
+		vertex_elements = parsed["vertex_elements"]
+		full_bones_offset = len(self.fullBoneList)
+		full_remap_offset = len(self.fullRemapTable)
+
+		self.boneList = []
+		for bone in parsed["bones"]:
+			matrix = NoeMat44.fromBytes(bone["local_matrix"]).toMat43()
+			matrix[3] *= fDefaultMeshScale
+			self.boneList.append(NoeBone(
+				bone["index"], bone["name"], matrix, None, bone["parent_index"]
+			))
+		self.boneList = rapi.multiplyBones(self.boneList)
+		for bone in self.boneList:
+			bone.index += full_bones_offset
+			if bone.parentIndex != -1:
+				bone.parentIndex += full_bones_offset
+			elif full_bones_offset > 0:
+				bone.parentIndex = 0
+		self.fullBoneList.extend(self.boneList)
+		self.fullRemapTable.extend([
+			bone_index + full_bones_offset for bone_index in parsed["bone_map"]
+		])
+
+		decoded_indices = []
+		for row in parsed["bone_indices"]:
+			decoded_indices.extend([index + full_remap_offset for index in row])
+			decoded_indices.extend([0, 0])
+		bone_index_buffer = struct.pack(
+			"<" + "H" * len(decoded_indices), *decoded_indices
+		)
+
+		for submesh in parsed["submeshes"]:
+			mesh_name = "LOD_" + str(submesh["lod_index"] + 1) + "_Group_" + str(
+				submesh["group_id"]
+			) + "_Sub_" + str(submesh["submesh_index"] + 1)
+			material_name = parsed["material_names"][submesh["material_index"]]
+			if material_name not in self.matNames:
+				self.matNames.append(material_name)
+			rapi.rpgSetName(mesh_name + "__" + material_name if bImportMaterialNames else mesh_name)
+			rapi.rpgSetMaterial(material_name)
+			rapi.rpgSetPosScaleBias(
+				(fDefaultMeshScale, fDefaultMeshScale, fDefaultMeshScale), (0, 0, 0)
+			)
+
+			vertex_start = submesh["vertex_start"]
+			position = vertex_elements[0]
+			rapi.rpgBindPositionBufferOfs(
+				vertex_buffer, noesis.RPGEODATA_FLOAT, position["stride"],
+				position["offset"] + position["stride"] * vertex_start
+			)
+			if bNORMsEnabled:
+				normal = vertex_elements[1]
+				normal_offset = normal["offset"] + normal["stride"] * vertex_start
+				rapi.rpgBindNormalBufferOfs(
+					vertex_buffer, noesis.RPGEODATA_BYTE, normal["stride"], normal_offset
+				)
+				if bTANGsEnabled:
+					rapi.rpgBindTangentBufferOfs(
+						vertex_buffer, noesis.RPGEODATA_BYTE, normal["stride"], normal_offset + 4
+					)
+			if bUVsEnabled:
+				uv = vertex_elements[2]
+				rapi.rpgSetUVScaleBias(NoeVec3((1, 1, 1)), NoeVec3((0, 0, 0)))
+				rapi.rpgBindUV1BufferOfs(
+					vertex_buffer, noesis.RPGEODATA_HALFFLOAT, uv["stride"],
+					uv["offset"] + uv["stride"] * vertex_start
+				)
+			if bSkinningEnabled:
+				weight = vertex_elements[4]
+				rapi.rpgSetBoneMap(self.fullRemapTable)
+				rapi.rpgBindBoneIndexBufferOfs(
+					bone_index_buffer, noesis.RPGEODATA_USHORT, 16, vertex_start * 16, 8
+				)
+				rapi.rpgBindBoneWeightBufferOfs(
+					vertex_buffer, noesis.RPGEODATA_UBYTE, weight["stride"],
+					weight["offset"] + weight["stride"] * vertex_start + 8, 8
+				)
+			if bColorsEnabled:
+				color = vertex_elements[5]
+				rapi.rpgBindColorBufferOfs(
+					vertex_buffer, noesis.RPGEODATA_UBYTE, color["stride"],
+					color["offset"] + color["stride"] * vertex_start, 4
+				)
+
+			if bRenderAsPoints:
+				rapi.rpgCommitTriangles(
+					None, noesis.RPGEODATA_USHORT, submesh["vertex_count"],
+					noesis.RPGEO_POINTS, 0x1
+				)
+			else:
+				rapi.rpgCommitTriangles(
+					submesh["index_buffer"], noesis.RPGEODATA_USHORT,
+					submesh["index_count"], noesis.RPGEO_TRIANGLE, 0x1
+				)
+			rapi.rpgClearBufferBinds()
+
+		self.importStats = parsed["stats"]
+		return 1
+
 	def loadMeshFile(self): #, mdlList):
 		
 		global sGameName, bSkinningEnabled, isMeshVer3, namesOffsLocation, extractedNativesPath
+		if self.capability == PRAGMATA_250707828:
+			return self._loadPragmataMeshFile()
 		
 		self.rootDir = GetRootGameDir(self.path)
 		extractedNativesPath = LoadExtractedDir(sGameName)
@@ -4125,6 +4804,8 @@ def meshLoadModel(data, mdlList):
 	ctx = rapi.rpgCreateContext()
 	mesh = meshFile(data)
 	mesh.setGameName()
+	isPragmataLoad = mesh.capability == PRAGMATA_250707828
+	pragmataStats = []
 	dialogOptions.motDialog = None
 	dialogOptions.dialog = None
 	dialogOptions.currentDir = ""
@@ -4140,6 +4821,21 @@ def meshLoadModel(data, mdlList):
 			dialog.createMeshWindow()
 	
 	if not dialog.isCancelled:
+		pragmataCandidatePaths = [
+			path for path in dialog.fullLoadItems
+			if path.lower().endswith(".251121828")
+		]
+		if len(pragmataCandidatePaths) > 1:
+			pragmataLoadCount = 0
+			for fullMeshPath in pragmataCandidatePaths:
+				capability = detectMeshCapability(
+					rapi.loadIntoByteArray(fullMeshPath), fullMeshPath
+				)
+				if capability is not None and capability.key == PRAGMATA_MESH_CAPABILITY_KEY:
+					pragmataLoadCount += 1
+			if pragmataLoadCount > 1:
+				print("RE_MESH_PROFILE_ERROR:multiple-pragmata-load-items")
+				return 0
 		for fullMeshPath in dialog.fullLoadItems:
 			meshToLoad = meshFile(rapi.loadIntoByteArray(fullMeshPath), fullMeshPath)
 			meshToLoad.fullBoneList = dialog.pak.fullBoneList
@@ -4147,13 +4843,29 @@ def meshLoadModel(data, mdlList):
 			meshToLoad.fullTexList = dialog.pak.fullTexList
 			meshToLoad.fullMatList = dialog.pak.fullMatList
 			meshToLoad.loadMeshFile()
-		try:
-			mdl = rapi.rpgConstructModelAndSort()
+			if meshToLoad.capability == PRAGMATA_250707828:
+				isPragmataLoad = True
+				if meshToLoad.importStats is not None:
+					pragmataStats.append(meshToLoad.importStats)
+		if isPragmataLoad:
+			try:
+				mdl = rapi.rpgConstructModelAndSort()
+			except Exception:
+				print("RE_MESH_PROFILE_ERROR:model-construction-failed")
+				return 0
+			if not getattr(mdl, "meshes", None):
+				print("RE_MESH_PROFILE_ERROR:model-construction-failed")
+				return 0
 			if mdl.meshes[0].name.find("_") == 4:
 				print ("\nWARNING: Noesis split detected!\n   Export this mesh to FBX with the advanced option '-fbxmeshmerge'\n")
-		except:
-			print("Failed to construct model from rpgeo context")
-			mdl = NoeModel()
+		else:
+			try:
+				mdl = rapi.rpgConstructModelAndSort()
+				if mdl.meshes[0].name.find("_") == 4:
+					print ("\nWARNING: Noesis split detected!\n   Export this mesh to FBX with the advanced option '-fbxmeshmerge'\n")
+			except:
+				print("Failed to construct model from rpgeo context")
+				mdl = NoeModel()
 	else:
 		mdl = NoeModel()
 	
@@ -4209,6 +4921,11 @@ def meshLoadModel(data, mdlList):
 			collapseBones(mdl, 1)
 			break
 		boneNames[bone.name.lower()] = True
+
+	for importStats in pragmataStats:
+		print("RE_MESH_STATS_JSON:" + json.dumps(
+			importStats, sort_keys=True, separators=(",", ":")
+		))
 	
 	return 1
 

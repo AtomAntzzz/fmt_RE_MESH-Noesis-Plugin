@@ -10,3 +10,5 @@ The histories are preserved through a Git merge rather than a squash or history 
 No repository-level `LICENSE`, `COPYING`, or prior `NOTICE` file was present in either source repository at migration time. This notice does not relicense either source or grant rights beyond those already provided by the respective authors and file histories.
 
 The current repository tree intentionally omits the former 3ds Max MaxScript files. Their presence in inherited upstream history does not mean they are part of the current distribution.
+
+The scoped PRAGMATA MESH additions in `fmt_RE_MESH.py` were independently authored from observed binary behavior and regression evidence. The GPLv3 RE-Mesh-Editor project was used only as an external comparison tool; its implementation was not copied into this repository.

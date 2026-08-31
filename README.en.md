@@ -23,7 +23,18 @@ This repository combines alphaZomega's Noesis plugin for RE Engine assets with A
 - Apollo Justice: Ace Attorney Trilogy
 - Dragon's Dogma 2
 
-This list is retained from alphaZomega's public v3.28 documentation. It does not claim support for newer games that have not completed sample-based regression. PRAGMATA, Resident Evil 9, and Monster Hunter Wilds are not part of this repository's currently verified support statement.
+This list is retained from alphaZomega's public v3.28 documentation. It does not claim support for newer games that have not completed sample-based regression. Resident Evil 9 and Monster Hunter Wilds are not part of this repository's currently verified support statement; PRAGMATA has only the strictly scoped single-profile support described below.
+
+## Scoped PRAGMATA support
+
+Current support is limited to one observed candidate 002 exact MESH profile: external suffix `.mesh.251121828`, internal version `250707828`, ordinary standalone, non-MPLY, skinned, with one LOD / group / submesh. The frozen sample SHA-256 is `78001dd7dd85da34434e48ae4a9426ba71d023d54dab30f3c490f69471fa4068`.
+
+- Read-only import of this exact profile is `readable`; its geometry-only Noesis preview is `previewable`.
+- GUI verification reported `Models 1 / Meshes 1 / Textures 0 / Materials 0 / Bones 229`. Zero textures/materials means materialized preview is not supported, and visual correctness of bones/weights has not been verified.
+- Candidate 001, other `.251121828` structures, multi-LOD, multi-material, streaming, MPLY, TEX/MDF2/MOTLIST, export, independent re-import, and game runtime are outside this claim.
+- The plugin fails this capability closed when files with the same suffix do not satisfy the exact structural invariants. This single-sample profile must not be read as support for the whole PRAGMATA format family.
+
+No PRAGMATA commercial samples, filename lists, extraction manifests, or GUI evidence files are included in this repository.
 
 ## Install the Noesis plugin
 
