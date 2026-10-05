@@ -35,6 +35,7 @@ RUNTIME_DEPENDENCIES = (
 	'dialogOptions',
 	'fDefaultMeshScale',
 	'getChildBones',
+	'hash_wide',
 	'noesis',
 	'openOptionsDialogImportWindow',
 	'rapi',
@@ -266,8 +267,38 @@ def bind(runtime):
 					slots.append(slot_index)
 			return slots
 
+	def _mapAnimationTracks(tracks, source_bones, mesh_bones):
+		# Keep the MESH bind pose and weight indices; only remap animation tracks.
+		by_hash = {}
+		for index, bone in enumerate(mesh_bones):
+			bone_hash = runtime.hash_wide(runtime.cleanBoneName(bone.name), True)
+			if bone_hash in by_hash:
+				raise MeshProfileError("animation-binding-ambiguous-bone")
+			by_hash[bone_hash] = index
+		source_by_hash = dict((bone["hash"], bone) for bone in source_bones)
+		mapped = []
+		for track in tracks:
+			mapped_track = dict(track)
+			target_index = by_hash.get(track["bone_hash"])
+			source = source_by_hash.get(track["bone_hash"])
+			if target_index is not None and source is not None:
+				parent = source["parent_index"]
+				target_parent = mesh_bones[target_index].parentIndex
+				if parent is None and target_parent != -1:
+					# Mounted local roots (e.g. facial clips), as in the legacy loader.
+					target_index = None
+				elif parent is not None:
+					mapped_parent = by_hash.get(source_bones[parent]["hash"])
+					if mapped_parent != target_parent:
+						raise MeshProfileError("animation-binding-parent")
+			mapped_track["bone_index"] = target_index
+			mapped_track["binding_status"] = (
+				"bound" if target_index is not None else "external-skeleton-required")
+			mapped.append(mapped_track)
+		return mapped
+
 	def buildPragmataMotlist1057MultiModel(
-			data, path, selected_slots=None, decoded=None):
+			data, path, selected_slots=None, decoded=None, mesh_bones=None):
 		if decoded is None:
 			decoded = re_common.decode_pragmata_motlist_1057_multi(
 				data, path, error_type=MeshProfileError)
@@ -300,23 +331,29 @@ def bind(runtime):
 		selected_actions = [row[1] for row in selected_rows]
 		bone_records = selected_rows[0][0]["bones"] if selected_rows else decoded["bones"]
 		for selection_decoded, _action in selected_rows:
-			if selection_decoded["bones"] != bone_records:
+			if mesh_bones is None and selection_decoded["bones"] != bone_records:
 				raise MeshProfileError(
 					"structural-profile-mismatch:animation-selection-skeleton")
-		bones = runtime._buildPragmataMotlistBones(bone_records)
+		bones = (runtime._buildPragmataMotlistBones(bone_records)
+				 if mesh_bones is None else mesh_bones)
 		animations = []
 		skipped_external = 0
 		selected_track_count = 0
-		for action in selected_actions:
-			selected_track_count += len(action["tracks"])
+		for selection_decoded, action in selected_rows:
+			tracks = action["tracks"]
+			if mesh_bones is not None:
+				tracks = _mapAnimationTracks(tracks, selection_decoded["bones"], mesh_bones)
+			selected_track_count += len(tracks)
 			keyframed_bones, action_skipped = (
 				runtime._buildPragmataMotlistKeyFramedBones(
-					action["tracks"], action["frame_rate"], len(bones)))
+					tracks, action["frame_rate"], len(bones)))
 			skipped_external += action_skipped
 			animations.append(runtime.NoeKeyFramedAnim(
 				action["name"], bones, keyframed_bones,
 				float(action["frame_rate"])))
 
+		if mesh_bones is not None and selected_track_count == skipped_external:
+			raise MeshProfileError("animation-binding-no-matching-tracks")
 		model = runtime.NoeModel()
 		model.setBones(bones)
 		model.setAnims(animations)

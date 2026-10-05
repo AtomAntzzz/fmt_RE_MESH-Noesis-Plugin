@@ -18,6 +18,7 @@ RUNTIME_DEPENDENCIES = (
 	'NoeBitStream',
 	'NoeModel',
 	'NoeModelMaterials',
+	'PragmataMotlistSelectionSource',
 	'Version',
 	'_detectPragmataIdentity',
 	'_parsePragmataMeshData',
@@ -37,6 +38,7 @@ RUNTIME_DEPENDENCIES = (
 	'parsePragmataHeader',
 	'parsePragmataMplyHeader',
 	'rapi',
+	'sGameName',
 	'selectPragmataMotlistActions',
 	'shouldPromptPragmataMotlistSelection',
 )
@@ -162,13 +164,24 @@ def bind(runtime):
 		runtime.dialogOptions.motDialog = None
 		runtime.dialogOptions.dialog = None
 		runtime.dialogOptions.currentDir = ""
-		dialog = runtime.openOptionsDialogImportWindow(None, None, {"mesh":mesh})
+		meshGame = runtime.sGameName
+		meshArgs = {"mesh": mesh}
+		if isPragmataLoad:
+			meshArgs["animationSource"] = runtime.PragmataMotlistSelectionSource
+		dialog = runtime.openOptionsDialogImportWindow(None, None, meshArgs)
 		dialog.path = runtime.rapi.getInputName()
 		dialog.createMeshWindow()
 
 		while runtime.dialogOptions.motDialog and runtime.dialogOptions.motDialog.isOpen:
-			runtime.dialogOptions.motDialog.createMotlistWindow()
-			runtime.dialogOptions.motDialog.isOpen = False
+			mlDialog = runtime.dialogOptions.motDialog
+			try:
+				mlDialog.createMotlistWindow()
+			finally:
+				mlDialog.isOpen = False
+				if mlDialog.selectionOnly:
+					runtime.sGameName = meshGame
+					runtime.dialogOptions.dialog = dialog
+					runtime.dialogOptions.currentDir = dialog.currentDir
 			if dialog.isOpen:
 				runtime.dialogOptions.currentDir = dialog.currentDir
 				dialog.createMeshWindow()
@@ -226,8 +239,17 @@ def bind(runtime):
 			mdl = runtime.NoeModel()
 
 		doLoadAnims = (runtime.dialogOptions.motDialog and runtime.dialogOptions.motDialog.loadItems and not runtime.dialogOptions.motDialog.isCancelled)
-		if doLoadAnims:
-			mlDialog = runtime.dialogOptions.motDialog
+		mlDialog = runtime.dialogOptions.motDialog
+		if mlDialog and mlDialog.selectionOnly:
+			doLoadAnims = bool(mlDialog.selectedActions) and not mlDialog.isCancelled and not dialog.isCancelled
+		if doLoadAnims and mlDialog.selectionOnly:
+			firstSelection = mlDialog.selectedActions[0]
+			animationModel = runtime.buildPragmataMotlist1057MultiModel(
+				b"", firstSelection["path"], mlDialog.selectedActions,
+				firstSelection["decoded"], mesh_bones=dialog.pak.fullBoneList)
+			mdl.setBones(animationModel.bones)
+			mdl.setAnims(animationModel.anims)
+		elif doLoadAnims:
 			sortedMlists = []
 			for mlist in [mlDialog.loadedMlists[path] for path in mlDialog.fullLoadItems]:
 				if mlist not in sortedMlists:

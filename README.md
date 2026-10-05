@@ -24,7 +24,7 @@
 - Exoprimal
 - Apollo Justice: Ace Attorney Trilogy
 - Dragon's Dogma 2
-- PRAGMATA（模型、材质、纹理和独立骨骼动画；具体范围见下文）
+- PRAGMATA（模型、材质、纹理、独立骨骼动画及模型动画绑定；具体范围见下文）
 
 前 11 款游戏沿用 alphaZomega v3.28 的公开支持列表，PRAGMATA 为本分支新增支持；各游戏的功能范围并不完全相同。Resident Evil 9 和 Monster Hunter Wilds 不在本仓库当前已验证声明中。PRAGMATA 仅限已观察 profile，不能理解为其全部 build、全部角色或所有同后缀文件都受支持。
 
@@ -37,9 +37,9 @@
 | MESH/MPLY | `.mesh.251121828`，internal `250707828`，魔数 `MESH` 或 `MPLY` | 冻结的 ordinary candidate 002、standalone multi-material、standalone multi-LOD、RE-067A reserved-ushort submission boundary、candidate 001 paired streaming、RE-067B compact one-entry paired streaming、RE-067C binary16 blend-shape、paired MPLY、playergame 和 face base-geometry profiles 为 scoped `readable`；只有已有独立 Noesis GUI 证据的子集为 `previewable`。 |
 | TEX | `.tex.251111100`，internal `251111100` | observed structural matrix 为 bounds-safe `readable`；原 256×256 BC7 / 6-mip exact profile 有独立像素 oracle，并为 `previewable`。其他格式只按下述代表性证据声明。 |
 | MDF2 | `.mdf2.51`，observed header version `1` | candidate 002 单材质 exact profile 及 playergame/face observed multi-material profiles 可读取和绑定；不保证 proprietary master shader 还原。 |
-| MOTLIST | 冻结的 `.motlist.1057` / MOT `993` standalone profiles | RE-066 单动作、本地骨骼 exact profile，以及 RE-068 的 24 个 observed multi-action/shared-bones profiles 为 scoped `readable` / `previewable`；使用与 DD2 相同的公共动画选择窗口。 |
+| MOTLIST | 冻结的 `.motlist.1057` / MOT `993` standalone profiles | RE-066 单动作、本地骨骼 exact profile，以及 RE-068 的 24 个 observed multi-action/shared-bones profiles 为 scoped `readable` / `previewable`；使用与 DD2 相同的公共动画选择窗口。RE-086 另验证了主角模型动画绑定，见下文。 |
 
-已冻结的 MESH 范围包括 ordinary、multi-material、multi-LOD、一个 companion 配对的 streaming profile 和一个 companion 配对的 MPLY profile。candidate 002 有 geometry/materialized GUI 证据；multi-LOD 有几何 GUI 证据。player/face 已有骨架 overlay 与确定性诊断姿态证据，但这只验证已观察 12-slot 权重影响，不等于完整角色着色、shape-key 可用性或自然动画 preview；没有独立 GUI 的 paired streaming/MPLY 也不会因为同一解析器能读就自动提升为 `previewable`。
+已冻结的 MESH 范围包括 ordinary、multi-material、multi-LOD、一个 companion 配对的 streaming profile 和一个 companion 配对的 MPLY profile。candidate 002 有 geometry/materialized GUI 证据；multi-LOD 有几何 GUI 证据。player/face 已有骨架 overlay 与确定性诊断姿态证据，但这只验证已观察 12-slot 权重影响，不等于完整角色着色或 shape-key 可用性；自然动画另有下述 RE-086 绑定证据；没有独立 GUI 的 paired streaming/MPLY 也不会因为同一解析器能读就自动提升为 `previewable`。
 
 TEX 的广度证据覆盖 22,346 个 observed `.tex.251111100` 文件的结构清点，并用真实 Noesis 验证 15 个 observed DXGI 格式及 array/cube/volume 代表。只有原 exact BC7 profile 做过独立逐像素 oracle；其余代表证明可操作的解码/导出路径，不表示所有 TEX 都有像素精确证明。
 
@@ -68,7 +68,9 @@ RE-066 已完成已冻结的 PRAGMATA MOTLIST v1057 / MOT v993 单动作、本�
 
 RE-068 另外验证了 24 个 observed multi-action/shared-bones profiles，包括已观察的 dense/sparse/mixed 条目和共享骨骼布局。这些 standalone profiles 为 scoped `readable` / `previewable`，复用与 DD2 相同的公共动画选择窗口，支持切换文件、选择和排队加载动作。
 
-PRAGMATA 动画目前应直接打开 MOTLIST，使用其自带骨架预览。Noesis 内从 MESH 的 `Select Animations` 入口直接绑定外部模型（external MESH binding）实测未通过，暂不支持；不要通过该入口强行输入 PRAGMATA MOTLIST 路径。无法匹配到骨架的轨道沿用既有策略跳过，并记录跳过数量。
+PRAGMATA 支持直接打开 MOTLIST 预览其自带骨架，也支持从 MESH 的 `Select Animations` 入口绑定动画。操作方式与 DD2 共用窗口：打开模型，点击 `Select Animations`，选择 MOTLIST（可粘贴完整路径），双击动作或 `[ALL]` 加入队列，点击 `Load` 返回，再在模型窗口点击 `Load`。可跨文件排队，取消后重开保留目录与队列。
+
+RE-086 已在真实 Noesis 中验证主角模型与 develop 的全部 3 个动作、general 的 1 个动作跨文件绑定播放；模型保留 229 根骨骼及原权重。develop/general/damage 三份文件另完成适配层数值映射检查，这不代表所有角色配对均已验证。轨道按骨名哈希映射到模型骨架，无法匹配的轨道继续跳过并记录数量；无匹配轨道或已知父空间冲突会明确拒绝。PRAGMATA 路径尚未实现 `Force Center`、`Sync by Frame Count`、`Force Merge All`，这三个选项置灰；DD2 原选项保持可用。
 
 该范围不覆盖 observed matrix 之外的其他 v1057 layouts、MTRE 语义、5 个 MTRE-only 文件、MOTLIST export、independent re-import 或 game runtime。不能把上述结果外推为所有 `.motlist.1057` 文件均受支持。
 
@@ -87,7 +89,7 @@ PRAGMATA 动画目前应直接打开 MOTLIST，使用其自带骨架预览。Noe
 3. 在 REEM 中选择 Noesis 可执行文件及 `.mesh.*` 或 `.motlist.*`。
 4. 对上游已支持的 MOTLIST，可在 Noesis 选择窗口双击 `[ALL]` 后载入，再按片段导出。
 
-此通用 Maya 流程不会扩大上述 RE-066/RE-068 standalone profiles 的声明。PRAGMATA 的 Maya 动画导出流程尚未验证；external MESH binding、范围外布局、export、independent re-import 与 runtime 仍不提供。
+此通用 Maya 流程不会扩大上述 RE-066/RE-068 standalone profiles 的声明。PRAGMATA 的 Maya 动画导出流程尚未验证；Noesis 内模型绑定播放的证据不能替代 Maya 导出验证。范围外布局、原生 MOTLIST export、independent re-import 与 runtime 仍不提供。
 
 ## 来源与说明
 

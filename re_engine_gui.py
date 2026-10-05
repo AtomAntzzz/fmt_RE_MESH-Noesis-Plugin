@@ -113,9 +113,24 @@ def bind(runtime):
 			elif self.isMotlist and runtime.dialogOptions.motDialog:
 				self.motItems = runtime.dialogOptions.motDialog.motItems
 
+
+			previous = runtime.dialogOptions.motDialog
+			if (self.isMotlist and self.selectionOnly and previous and
+					previous.selectionSource is self.selectionSource and not args.get("motlist")):
+				self.pak = previous.pak
+				self.loadItems = list(previous.loadItems)
+				self.fullLoadItems = list(previous.fullLoadItems)
+				self.selectionSources = dict(previous.selectionSources)
+				self.motItems = list(previous.motItems)
+				self.currentDir = previous.currentDir
+				runtime.dialogOptions.currentDir = self.currentDir
+
 		def openMotlistDialogButton(self, noeWnd, controlId, wParam, lParam):
 			if not runtime.dialogOptions.motDialog or not runtime.dialogOptions.motDialog.isOpen:
-				runtime.dialogOptions.motDialog = runtime.openOptionsDialogImportWindow(None, None, {"isMotlist": True})
+				runtime.dialogOptions.motDialog = runtime.openOptionsDialogImportWindow(None, None, {
+					"isMotlist": True,
+					"selectionSource": self.args.get("animationSource"),
+				})
 				self.noeWnd.closeWindow()
 				#dialogOptions.motDialog.createMotlistWindow()
 
@@ -417,6 +432,7 @@ def bind(runtime):
 			text = self.currentDirEditBox.getText().lower()
 			if text != runtime.dialogOptions.currentDir.lower() and os.path.exists(text):
 				runtime.dialogOptions.currentDir = os.path.dirname(text) if os.path.isfile(text) else text
+				self.currentDir = runtime.dialogOptions.currentDir
 				self.setPakList()
 				if os.path.isfile(text):
 					lowerAllFiles = [name.lower() for name in self.allFiles]
@@ -475,15 +491,18 @@ def bind(runtime):
 				if True:
 					index = self.noeWnd.createCheckBox("Force Center", 10, 640, 100, 30, self.checkFCenterCheckbox)
 					self.FCenterCheckbox = self.noeWnd.getControlByIndex(index)
-					self.FCenterCheckbox.setChecked(runtime.dialogOptions.doForceCenter)
+					self.FCenterCheckbox.setChecked(not self.selectionOnly and runtime.dialogOptions.doForceCenter)
+					self.noeWnd.enableControlByIndex(index, not self.selectionOnly)
 
 					index = self.noeWnd.createCheckBox("Sync by Frame Count", 10, 670, 160, 30, self.checkSyncCheckbox)
 					self.syncCheckbox = self.noeWnd.getControlByIndex(index)
-					self.syncCheckbox.setChecked(runtime.dialogOptions.doSync)
+					self.syncCheckbox.setChecked(not self.selectionOnly and runtime.dialogOptions.doSync)
+					self.noeWnd.enableControlByIndex(index, not self.selectionOnly)
 
 					index = self.noeWnd.createCheckBox("Force Merge All", 10, 700, 160, 30, self.checkForceMergeCheckbox)
 					self.forceMergeCheckbox = self.noeWnd.getControlByIndex(index)
-					self.forceMergeCheckbox.setChecked(runtime.dialogOptions.doForceMergeAnims)
+					self.forceMergeCheckbox.setChecked(not self.selectionOnly and runtime.dialogOptions.doForceMergeAnims)
+					self.noeWnd.enableControlByIndex(index, not self.selectionOnly)
 
 				self.noeWnd.createStatic("Game:", width-218, 645, 60, 20)
 				index = self.noeWnd.createComboBox(width-170, 645, 150, 20, self.selectGameBoxItem, runtime.noewin.CBS_DROPDOWNLIST) #CB

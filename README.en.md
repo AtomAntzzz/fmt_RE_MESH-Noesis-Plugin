@@ -24,7 +24,7 @@ This repository combines alphaZomega's Noesis plugin for RE Engine assets with A
 - Exoprimal
 - Apollo Justice: Ace Attorney Trilogy
 - Dragon's Dogma 2
-- PRAGMATA (models, materials, textures, and standalone skeletal animation; see scope below)
+- PRAGMATA (models, materials, textures, standalone skeletal animation, and mesh animation binding; see scope below)
 
 The first 11 games retain alphaZomega's public v3.28 support list; PRAGMATA support is added by this fork. Available features vary by game. Resident Evil 9 and Monster Hunter Wilds are outside this repository's current verified statement. PRAGMATA support covers observed profiles only; it is not a claim for every build, character, or file sharing the same suffix.
 
@@ -37,9 +37,9 @@ The first 11 games retain alphaZomega's public v3.28 support list; PRAGMATA supp
 | MESH/MPLY | `.mesh.251121828`, internal `250707828`, `MESH` or `MPLY` magic | Frozen ordinary candidate 002, standalone multi-material, standalone multi-LOD, the RE-067A reserved-ushort submission boundary, candidate 001 paired streaming, the RE-067B compact one-entry paired-streaming profile, the RE-067C binary16 blend-shape profile, paired MPLY, playergame, and face base-geometry profiles are scoped `readable`; only subsets with separate Noesis GUI evidence are `previewable`. |
 | TEX | `.tex.251111100`, internal `251111100` | The observed structural matrix is bounds-safe `readable`; the original 256×256 BC7 / 6-mip exact profile has an independent pixel oracle and is `previewable`. Other formats are limited to the representative evidence below. |
 | MDF2 | `.mdf2.51`, observed header version `1` | The candidate 002 single-material exact profile and observed playergame/face multi-material profiles can be parsed and bound. Proprietary master-shader fidelity is not claimed. |
-| MOTLIST | Frozen `.motlist.1057` / MOT `993` standalone profiles | The RE-066 single-action/local-bone exact profile and RE-068's 24 observed multi-action/shared-bones profiles are scoped `readable` / `previewable`, using the same shared animation selection dialog as DD2. |
+| MOTLIST | Frozen `.motlist.1057` / MOT `993` standalone profiles | The RE-066 single-action/local-bone exact profile and RE-068's 24 observed multi-action/shared-bones profiles are scoped `readable` / `previewable`, using the same shared animation selection dialog as DD2. RE-086 separately validates player mesh animation binding as described below. |
 
-The frozen MESH scope includes ordinary, multi-material, multi-LOD, one paired streaming profile, and one paired MPLY profile. Candidate 002 has geometry/materialized GUI evidence, and multi-LOD has geometry GUI evidence. Player/face now have skeleton-overlay and deterministic diagnostic-pose evidence, but that validates only the observed 12-slot weight influence; it is not full character shading, usable shape keys, or natural-animation preview. Paired streaming/MPLY subsets without independent GUI evidence are not automatically promoted to `previewable` merely because the parser can read them.
+The frozen MESH scope includes ordinary, multi-material, multi-LOD, one paired streaming profile, and one paired MPLY profile. Candidate 002 has geometry/materialized GUI evidence, and multi-LOD has geometry GUI evidence. Player/face now have skeleton-overlay and deterministic diagnostic-pose evidence, but that validates only the observed 12-slot weight influence; it is not full character shading or usable shape keys. Natural-animation binding has separate RE-086 evidence below. Paired streaming/MPLY subsets without independent GUI evidence are not automatically promoted to `previewable` merely because the parser can read them.
 
 TEX breadth evidence covers a structural inventory of 22,346 observed `.tex.251111100` files. Real Noesis runs covered 15 observed DXGI formats plus representative array, cube, and volume files. Only the original exact BC7 profile has an independent pixel-by-pixel oracle; the rest prove an operational representative decode/export path, not pixel-exact coverage for every TEX.
 
@@ -68,7 +68,9 @@ RE-066 is complete for the frozen PRAGMATA MOTLIST v1057 / MOT v993 single-actio
 
 RE-068 additionally verifies 24 observed multi-action/shared-bones profiles, including observed dense/sparse/mixed entries and shared skeleton layouts. These standalone profiles are scoped `readable` / `previewable` and reuse the same shared animation selection dialog as DD2, including file switching, action selection, and queued loading.
 
-Open PRAGMATA MOTLIST files directly to preview animations with their own skeleton. Direct external MESH binding through the MESH `Select Animations` entry point failed validation in Noesis and is currently unsupported; do not force a PRAGMATA MOTLIST path through that entry point. Tracks that cannot be matched to the skeleton follow the existing skip policy, with the skipped count logged.
+PRAGMATA supports both standalone MOTLIST skeleton preview and animation binding through the MESH `Select Animations` entry point. Use the shared DD2 dialog: open a mesh, click `Select Animations`, select a MOTLIST (or paste its full path), double-click actions or `[ALL]` to queue them, click `Load` to return, then click `Load` in the mesh window. Actions can be queued across files; cancelling and reopening preserves the directory and queue.
+
+RE-086 validates real Noesis playback on the player mesh with all 3 develop actions and 1 general action queued across files, preserving the model's 229 bones and original weights. The develop/general/damage files also pass adapter-level numeric mapping checks; this does not validate every character pairing. Tracks map to mesh bones by name hash. Unmatched tracks are skipped and counted; no matching tracks or a known parent-space conflict produces an explicit error. `Force Center`, `Sync by Frame Count`, and `Force Merge All` are not implemented for the PRAGMATA path and are disabled there. DD2 retains its existing options.
 
 This scope does not cover other v1057 layouts outside the observed matrix, MTRE semantics, the 5 MTRE-only files, MOTLIST export, independent re-import, or game runtime. It does not imply support for every `.motlist.1057` file.
 
@@ -87,7 +89,7 @@ This scope does not cover other v1057 layouts outside the observed matrix, MTRE 
 3. In REEM, select the Noesis executable and a `.mesh.*` or `.motlist.*` file.
 4. For MOTLIST files supported by upstream, double-click `[ALL]` in the Noesis selector, load, and export clips.
 
-This general Maya workflow does not broaden the RE-066/RE-068 standalone profiles above. The PRAGMATA Maya animation export workflow has not been validated; external MESH binding, out-of-scope layouts, export, independent re-import, and runtime remain unavailable.
+This general Maya workflow does not broaden the RE-066/RE-068 standalone profiles above. The PRAGMATA Maya animation export workflow has not been validated; Noesis mesh-bound playback evidence does not validate Maya export. Out-of-scope layouts, native MOTLIST export, independent re-import, and runtime remain unavailable.
 
 ## Sources and notice
 
