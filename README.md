@@ -11,7 +11,7 @@
 - `pragmata_gdeflate_x86.dll` / `pragmata_gdeflate_x64.dll`：PRAGMATA TEX 所需的 GDeflate CPU 解码桥。
 - `REEM_Noesis_Maya.py`：通过 Noesis 导入 MESH/MOTLIST、读取动画日志并批量切分片段的 Maya 工具。
 
-## 上游 v3.28 列出的游戏
+## 支持的游戏
 
 - Resident Evil 2 Remake
 - Resident Evil 3 Remake
@@ -24,10 +24,11 @@
 - Exoprimal
 - Apollo Justice: Ace Attorney Trilogy
 - Dragon's Dogma 2
+- PRAGMATA（模型、材质、纹理和独立骨骼动画；具体范围见下文）
 
-此列表沿用 alphaZomega v3.28 的公开说明，不自动覆盖更新游戏。Resident Evil 9 和 Monster Hunter Wilds 不在本仓库当前已验证声明中。PRAGMATA 仅限已观察 profile，不能理解为其全部 build、全部角色或所有同后缀文件都受支持。
+前 11 款游戏沿用 alphaZomega v3.28 的公开支持列表，PRAGMATA 为本分支新增支持；各游戏的功能范围并不完全相同。Resident Evil 9 和 Monster Hunter Wilds 不在本仓库当前已验证声明中。PRAGMATA 仅限已观察 profile，不能理解为其全部 build、全部角色或所有同后缀文件都受支持。
 
-## PRAGMATA 限定支持
+## PRAGMATA 支持范围
 
 这里把 `readable`（能够按已验证结构安全读取）和 `previewable`（另有 Noesis 预览证据）分开。能力选择使用 internal version 与结构不变量，不单靠游戏名或外部后缀。
 
@@ -67,11 +68,14 @@ RE-066 已完成已冻结的 PRAGMATA MOTLIST v1057 / MOT v993 单动作、本�
 
 RE-068 另外验证了 24 个 observed multi-action/shared-bones profiles，包括已观察的 dense/sparse/mixed 条目和共享骨骼布局。这些 standalone profiles 为 scoped `readable` / `previewable`，复用与 DD2 相同的公共动画选择窗口，支持切换文件、选择和排队加载动作。
 
-该范围不提供 external MESH binding，不覆盖 observed matrix 之外的其他 v1057 layouts、MTRE 语义、5 个 MTRE-only 文件、MOTLIST export、independent re-import 或 game runtime。不能把上述结果外推为所有 `.motlist.1057` 文件均受支持。
+PRAGMATA 动画目前应直接打开 MOTLIST，使用其自带骨架预览。Noesis 内从 MESH 的 `Select Animations` 入口直接绑定外部模型（external MESH binding）实测未通过，暂不支持；不要通过该入口强行输入 PRAGMATA MOTLIST 路径。无法匹配到骨架的轨道沿用既有策略跳过，并记录跳过数量。
+
+该范围不覆盖 observed matrix 之外的其他 v1057 layouts、MTRE 语义、5 个 MTRE-only 文件、MOTLIST export、independent re-import 或 game runtime。不能把上述结果外推为所有 `.motlist.1057` 文件均受支持。
 
 ## 明确不支持的 PRAGMATA 范围
 
-- 不支持一般 PRAGMATA MESH/TEX 写出；candidate 002 只有实验性、单样本、source-template exact writer implementation，不能代表通用 export。
+- 不支持一般 PRAGMATA MESH/TEX 写出，且不列为支持目标。这里指写回游戏原生 `.mesh.*` / `.tex.*` 文件；candidate 002 只有实验性、单样本、source-template exact writer implementation，不能代表通用 export，也不作为受支持的写回功能。
+- 上述排除不指 Noesis 将已读入的模型或纹理转换为 FBX、OBJ、PNG、TGA 等通用格式；这些由 Noesis 对应导出器处理，是否保留骨骼、动画或形变取决于导出器和选项，不代表每种组合均已验证。
 - 不提供独立 re-import；上游两个 MaxScript 只做 3ds Max FBX → Noesis FBX merge → FBX 回到 3ds Max，并不读取 PRAGMATA MESH writer 输出。
 - 未做游戏运行时验证，不能声明 writer 输出会被游戏或官方工具接受。
 - 不保证 proprietary master shader、未验证 packed channels、patch-only profiles、其他 build 或所有同后缀资产。

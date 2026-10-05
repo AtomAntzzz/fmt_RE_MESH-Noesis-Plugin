@@ -11,7 +11,7 @@ This repository combines alphaZomega's Noesis plugin for RE Engine assets with A
 - `pragmata_gdeflate_x86.dll` / `pragmata_gdeflate_x64.dll`: the GDeflate CPU bridge required by PRAGMATA TEX.
 - `REEM_Noesis_Maya.py`: a Maya tool that drives Noesis for MESH/MOTLIST import, reads animation logs, and splits clips in batches.
 
-## Games listed by upstream v3.28
+## Supported games
 
 - Resident Evil 2 Remake
 - Resident Evil 3 Remake
@@ -24,10 +24,11 @@ This repository combines alphaZomega's Noesis plugin for RE Engine assets with A
 - Exoprimal
 - Apollo Justice: Ace Attorney Trilogy
 - Dragon's Dogma 2
+- PRAGMATA (models, materials, textures, and standalone skeletal animation; see scope below)
 
-This list is retained from alphaZomega's public v3.28 documentation and does not automatically cover newer games. Resident Evil 9 and Monster Hunter Wilds are outside this repository's current verified statement. PRAGMATA support covers observed profiles only; it is not a claim for every build, character, or file sharing the same suffix.
+The first 11 games retain alphaZomega's public v3.28 support list; PRAGMATA support is added by this fork. Available features vary by game. Resident Evil 9 and Monster Hunter Wilds are outside this repository's current verified statement. PRAGMATA support covers observed profiles only; it is not a claim for every build, character, or file sharing the same suffix.
 
-## Scoped PRAGMATA support
+## PRAGMATA support scope
 
 `readable` means that a frozen structural profile can be read safely. `previewable` additionally requires separate Noesis preview evidence. Capability selection uses internal versions and structural invariants, not the game name or external suffix alone.
 
@@ -67,11 +68,14 @@ RE-066 is complete for the frozen PRAGMATA MOTLIST v1057 / MOT v993 single-actio
 
 RE-068 additionally verifies 24 observed multi-action/shared-bones profiles, including observed dense/sparse/mixed entries and shared skeleton layouts. These standalone profiles are scoped `readable` / `previewable` and reuse the same shared animation selection dialog as DD2, including file switching, action selection, and queued loading.
 
-This scope does not provide external MESH binding or cover other v1057 layouts outside the observed matrix, MTRE semantics, the 5 MTRE-only files, MOTLIST export, independent re-import, or game runtime. It does not imply support for every `.motlist.1057` file.
+Open PRAGMATA MOTLIST files directly to preview animations with their own skeleton. Direct external MESH binding through the MESH `Select Animations` entry point failed validation in Noesis and is currently unsupported; do not force a PRAGMATA MOTLIST path through that entry point. Tracks that cannot be matched to the skeleton follow the existing skip policy, with the skipped count logged.
+
+This scope does not cover other v1057 layouts outside the observed matrix, MTRE semantics, the 5 MTRE-only files, MOTLIST export, independent re-import, or game runtime. It does not imply support for every `.motlist.1057` file.
 
 ## Explicitly unsupported PRAGMATA scope
 
-- General PRAGMATA MESH/TEX writing is not supported. Candidate 002 has only an experimental, single-sample, source-template exact writer implementation; this is not general export.
+- General PRAGMATA MESH/TEX writing is not supported and is excluded from the support targets. This means writing native game `.mesh.*` / `.tex.*` files. Candidate 002 has only an experimental, single-sample, source-template exact writer implementation; it is neither general export nor a supported write-back feature.
+- This exclusion does not refer to converting loaded models or textures to standard formats such as FBX, OBJ, PNG, or TGA using Noesis exporters. Preservation of skeletons, animations, or morphs depends on the exporter and its options; not every combination has been validated.
 - Independent re-import is not provided. The two upstream MaxScripts only perform a 3ds Max FBX → Noesis FBX merge → FBX return trip and do not read PRAGMATA MESH writer output.
 - Game runtime has not been validated. Writer output is not claimed to be accepted by the game or an official tool.
 - Proprietary master shaders, unverified packed channels, patch-only profiles, other builds, and every file sharing a suffix are not guaranteed.
