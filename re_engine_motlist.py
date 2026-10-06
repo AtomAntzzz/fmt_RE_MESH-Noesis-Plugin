@@ -2,6 +2,7 @@
 
 import copy
 import math
+from re_engine_animation import buildLocalBoneMatrix, setKeyFramedComponent
 from re_engine_config import (
 	formats,
 )
@@ -19,7 +20,6 @@ RUNTIME_DEPENDENCIES = (
 	'NoeBone',
 	'NoeKeyFramedAnim',
 	'NoeKeyFramedBone',
-	'NoeKeyFramedValue',
 	'NoeQuat',
 	'NoeQuat3',
 	'NoeVec3',
@@ -30,13 +30,26 @@ RUNTIME_DEPENDENCIES = (
 	'findGameName',
 	'hash_wide',
 	'motFile',
-	'noesis',
 	'readPackedBitsVec3',
 	'readUIntAt',
 	'readUnicodeStringAt',
 	'sGameName',
 	'skipToNextLine',
 )
+
+
+def readLegacyBoneRecord(bs, header_offset, ordinal, read_string_at):
+	bs.seek(header_offset + 80 * ordinal)
+	name = read_string_at(bs, bs.readUInt64())
+	parent_offset = bs.readUInt64()
+	parent_index = int((parent_offset - header_offset) / 80) if parent_offset else -1
+	bs.seek(16, 1)
+	translation = (bs.readFloat(), bs.readFloat(), bs.readFloat(), bs.readFloat())
+	rotation = (bs.readFloat(), bs.readFloat(), bs.readFloat(), bs.readFloat())
+	index = bs.readUInt()
+	bone_hash = bs.readUInt()
+	return {"name": name, "parent_index": parent_index, "local_translation": translation,
+		"local_rotation": rotation, "index": index, "hash": bone_hash}
 
 
 def bind(runtime):
@@ -233,19 +246,12 @@ def bind(runtime):
 			if boneHdrOffs:
 				bs.seek(boneHdrOffs)
 				for i in range(count):
-					bs.seek(self.boneHdrOffset+80*i)
-					boneName = runtime.readUnicodeStringAt(bs, bs.readUInt64())
-					#boneName = self.motlist.meshBones[i].name if i < len(self.motlist.meshBones) else boneName #SF6 facial anims test
-					parentOffset = bs.readUInt64()
-					parentIndex = int((parentOffset-self.boneHdrOffset)/80) if parentOffset else -1
-					bs.seek(16,1)
-					translation = runtime.NoeVec4((bs.readFloat(), bs.readFloat(), bs.readFloat(), bs.readFloat()))
-					quat = runtime.NoeQuat((bs.readFloat(), bs.readFloat(), bs.readFloat(), bs.readFloat())).transpose()
-					index = bs.readUInt()
-					boneHash = bs.readUInt()
-					mat = quat.toMat43()
-					mat[3] = translation.toVec3() * runtime.fDefaultMeshScale
-					self.boneHeaders.append(BoneHeader(name=boneName, pos=translation, rot=quat, index=index, parentIndex=parentIndex, hash=boneHash, mat=mat))
+					record = readLegacyBoneRecord(bs, self.boneHdrOffset, i, runtime.readUnicodeStringAt)
+					translation = runtime.NoeVec4(record["local_translation"])
+					quat = runtime.NoeQuat(record["local_rotation"]).transpose()
+					mat = buildLocalBoneMatrix(quat, translation.toVec3(), runtime.fDefaultMeshScale)
+					self.boneHeaders.append(BoneHeader(name=record["name"], pos=translation, rot=quat,
+						index=record["index"], parentIndex=record["parent_index"], hash=record["hash"], mat=mat))
 				self.motlist.boneHeaders = self.motlist.boneHeaders or self.boneHeaders
 			elif self.motlist.boneHeaders:
 				self.boneHeaders = self.motlist.boneHeaders
@@ -296,6 +302,28 @@ def bind(runtime):
 								#childBone.setMatrix(childMats[c] * self.motlist.bones[motlistBoneNames.index(childBone.parentName.lower())].getMatrix())
 								print("moving child", childBone.name)
 								childBone.setMatrix(NoeMat43())'''
+
+		def iterTrackKeys(self, fHeader, ftype):
+			bs = self.bs
+			keyCompression = fHeader.flags >> 20
+			keyReadFunc = bs.readUInt if keyCompression==5 else bs.readUByte if keyCompression==2 else bs.readUShort
+			bs.seek(fHeader.frameIndOffs)
+			keyTimes = []
+			for k in range(fHeader.keyCount):
+				keyTimes.append(keyReadFunc() if fHeader.frameIndOffs else 0)
+			if fHeader.unpackDataOffs:
+				bs.seek(fHeader.unpackDataOffs)
+				unpackMax = UnpackVec(x=bs.readFloat(), y=bs.readFloat(), z=bs.readFloat(), w=bs.readFloat())
+				unpackMin = UnpackVec(x=bs.readFloat(), y=bs.readFloat(), z=bs.readFloat(), w=bs.readFloat())
+			else:
+				unpackMax = unpackMin = UnpackVec(x=0, y=0, z=0, w=0)
+			unpackValues = Unpacks(max=unpackMax, min=unpackMin)
+			bs.seek(fHeader.frameDataOffs)
+			for f in range(fHeader.keyCount):
+				frame = self.readFrame(ftype, fHeader.flags, unpackValues)
+				if ftype == "scl":
+					frame /= 100
+				yield (keyTimes[f], frame)
 
 		def read(self):
 			bs = self.bs
@@ -371,33 +399,9 @@ def bind(runtime):
 					for ftype in ["pos", "rot", "scl"]:
 						fHeader = boneClip.get(ftype)
 						if fHeader:
-							keyCompression = fHeader.flags >> 20
-							keyReadFunc = bs.readUInt if keyCompression==5 else bs.readUByte if keyCompression==2 else bs.readUShort
-							bs.seek(fHeader.frameIndOffs)
-							keyTimes = []
-							for k in range(fHeader.keyCount):
-								keyTimes.append(keyReadFunc() if fHeader.frameIndOffs else 0)
-							if fHeader.unpackDataOffs:
-								bs.seek(fHeader.unpackDataOffs)
-								unpackMax = UnpackVec(x=bs.readFloat(), y=bs.readFloat(), z=bs.readFloat(), w=bs.readFloat())
-								unpackMin = UnpackVec(x=bs.readFloat(), y=bs.readFloat(), z=bs.readFloat(), w=bs.readFloat())
-							else:
-								unpackMax = unpackMin = UnpackVec(x=0, y=0, z=0, w=0)
-							unpackValues = Unpacks(max=unpackMax, min=unpackMin)
-							frames = []
-							bs.seek(fHeader.frameDataOffs)
-							for f in range(fHeader.keyCount):
-								frame = self.readFrame(ftype, fHeader.flags, unpackValues)
-								if ftype == "scl":
-									frame /= 100
-								kfValue = runtime.NoeKeyFramedValue(keyTimes[f], frame)
-								frames.append(kfValue)
-							if ftype == "pos": # and self.motlist.bones[motlistBoneIndex].parentIndex != 0:#kfBoneNames:
-								kfBone.setTranslation(frames, runtime.noesis.NOEKF_TRANSLATION_VECTOR_3)
-							elif ftype == "rot":
-								kfBone.setRotation(frames, runtime.noesis.NOEKF_ROTATION_QUATERNION_4)
-							elif ftype == "scl":
-								kfBone.setScale(frames, runtime.noesis.NOEKF_SCALE_VECTOR_3)
+							setKeyFramedComponent(runtime, kfBone,
+								{"pos": "translation", "rot": "rotation", "scl": "scale"}[ftype],
+								self.iterTrackKeys(fHeader, ftype))
 					self.kfBones.append(kfBone)
 			motEnd = bs.tell()
 

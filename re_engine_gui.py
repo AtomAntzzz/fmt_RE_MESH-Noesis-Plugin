@@ -2,6 +2,7 @@
 
 import os
 import time
+from re_engine_animation import LegacyMotlistSelectionSource
 from re_engine_config import (
 	formats,
 	fullGameNames,
@@ -23,7 +24,6 @@ RUNTIME_DEPENDENCIES = (
 	'findRootDir',
 	'getSameExtFilesInDir',
 	'iListboxSize',
-	'motlistFile',
 	'noesis',
 	'noewin',
 	'openOptionsDialogImportWindow',
@@ -33,6 +33,7 @@ RUNTIME_DEPENDENCIES = (
 
 
 def bind(runtime):
+	legacySelectionSource = LegacyMotlistSelectionSource(runtime)
 	class DialogOptions:
 		def __init__(self):
 			self.doLoadTex = False
@@ -146,21 +147,8 @@ def bind(runtime):
 			self.isOpen = False
 			if self.isMotlist:
 				self.loadedMlists = {}
-				bones = self.pak.bones
-				totalFrames = self.pak.totalFrames
-				mdlBoneNames = [bone.name for bone in bones]
-				for path in self.fullLoadItems:
-					if ".motlist." in path.lower() and path not in self.loadedMlists and runtime.rapi.checkFileExists(path):
-						self.loadedMlists[path] = runtime.motlistFile(runtime.rapi.loadIntoByteArray(path), path)
-						self.loadedMlists[path].bones = bones
-						self.loadedMlists[path].readBoneHeaders(self.loadItems)
-				for i, motName in enumerate(self.loadItems):
-					if motName.find("[ALL] - ") == 0:
-						fullPath = self.fullLoadItems[i]
-						for mot in self.loadedMlists[fullPath].mots:
-							if mot.name not in self.loadItems:
-								self.loadItems.append(mot.name)
-								self.fullLoadItems.append(fullPath)
+				legacySelectionSource.prepareSelection(
+					self.pak, self.loadItems, self.fullLoadItems, self.loadedMlists)
 			self.noeWnd.closeWindow()
 
 		def _resolveSelectionItems(self):
@@ -234,6 +222,8 @@ def bind(runtime):
 			self.clicker = DoubleClickTimer(name="motList", idx=self.motIdx, timer=time.time())
 
 		def _loadSelectionPak(self, path):
+			if not self.selectionOnly:
+				return legacySelectionSource.load(path)
 			if path not in self.selectionSources:
 				self.selectionSources[path] = self.selectionSource.load(path)
 			return self.selectionSources[path]
@@ -253,10 +243,7 @@ def bind(runtime):
 					runtime.dialogOptions.currentDir += "\\" + self.pakList.getStringForIndex(self.pakIdx)
 					self.setPakList()
 				elif self.isMotlist:
-					if self.selectionOnly:
-						self.pak = self._loadSelectionPak(path)
-					else:
-						self.pak = runtime.motlistFile(runtime.rapi.loadIntoByteArray(path), path)
+					self.pak = self._loadSelectionPak(path)
 					self.setMotLoadList([mot.name for mot in self.pak.mots])
 				elif self.pakList.getStringForIndex(self.pakIdx) not in self.loadItems:
 					self.loadItems.append(self.pakList.getStringForIndex(self.pakIdx))
@@ -439,10 +426,7 @@ def bind(runtime):
 					if runtime.rapi.getLocalFileName(text) in lowerAllFiles:
 						self.pakList.selectString(self.pakList.getStringForIndex(lowerAllFiles.index(runtime.rapi.getLocalFileName(text))))
 					if self.isMotlist and ".motlist" in text:
-						if self.selectionOnly:
-							self.pak = self._loadSelectionPak(text)
-						else:
-							self.pak = runtime.motlistFile(runtime.rapi.loadIntoByteArray(text), text)
+						self.pak = self._loadSelectionPak(text)
 						self.setMotLoadList([mot.name for mot in self.pak.mots])
 
 		def inputGlobalScaleEditBox(self, noeWnd, controlId, wParam, lParam):

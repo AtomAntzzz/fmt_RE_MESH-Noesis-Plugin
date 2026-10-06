@@ -4,6 +4,7 @@ import copy
 import os
 import re
 import struct
+from re_engine_materials import _materialCheckedRange, _materialScalar
 from re_engine_config import (
 	texFormatLayouts,
 	extToFormat,
@@ -19,8 +20,6 @@ from re_engine_types import (
 RUNTIME_DEPENDENCIES = (
 	'NoeBitStream',
 	'NoeTexture',
-	'_materialCheckedRange',
-	'_materialScalar',
 	'bImportMips',
 	'convertTexVersion',
 	'decodePragmataTexMips',
@@ -37,141 +36,150 @@ RUNTIME_DEPENDENCIES = (
 )
 
 
-def bind(runtime):
-	def parsePragmataTexProfile(data, path):
-		if not path.lower().endswith((".tex" + formats["PRAGMATA"]["texExt"])):
-			raise MaterialProfileError("tex-suffix-mismatch")
-		runtime._materialCheckedRange(data, 0, 0x28, "tex-header")
-		if data[0:4] != b"TEX\0":
-			raise MaterialProfileError("tex-magic-mismatch")
-		version = runtime._materialScalar(data, 4, "<I", "tex-version")
-		if version != formats["PRAGMATA"]["texVersion"]:
-			raise MaterialProfileError("tex-version-mismatch")
-		width, height, depth = struct.unpack_from("<HHH", data, 8)
-		image_count = data[0x0E]
-		mip_table_size = data[0x0F]
-		format_code = runtime._materialScalar(data, 0x10, "<I", "tex-format")
-		swizzle = runtime._materialScalar(data, 0x14, "<i", "tex-swizzle")
-		cubemap = runtime._materialScalar(data, 0x18, "<I", "tex-cubemap")
-		if width <= 0 or height <= 0 or depth <= 0 or image_count <= 0:
-			raise MaterialProfileError("tex-shape-mismatch")
-		if cubemap not in (0, 4) or (cubemap == 4 and image_count != 6):
-			raise MaterialProfileError("tex-shape-mismatch")
-		if depth > 1 and (image_count != 1 or cubemap != 0):
-			raise MaterialProfileError("tex-shape-mismatch")
-		format_layout = texFormatLayouts.get(format_code)
-		if format_layout is None:
-			raise MaterialProfileError("tex-format-mismatch")
-		unit_width, unit_height, unit_bytes = format_layout
-		if mip_table_size <= 0 or mip_table_size % 16:
-			raise MaterialProfileError("mip-table-size-mismatch")
-		mip_count = mip_table_size // 16
-		entry_count = image_count * mip_count
-		mip_table_start = 0x28
-		mip_table_byte_size = entry_count * 16
-		mip_table_end = mip_table_start + mip_table_byte_size
-		runtime._materialCheckedRange(data, mip_table_start, mip_table_byte_size, "mip-table")
-		chunk_table_start = mip_table_end
-		chunk_table_size = entry_count * 8
-		runtime._materialCheckedRange(data, chunk_table_start, chunk_table_size, "physical-chunk-table")
-		payload_start = chunk_table_start + chunk_table_size
-		expected_logical_offset = mip_table_end
-		expected_physical_relative = 0
-		mips = []
-		for index in range(entry_count):
-			image_index = index // mip_count
-			mip_index = index % mip_count
-			logical_offset, pitch, logical_size = struct.unpack_from("<QII", data, mip_table_start + index * 16)
-			if logical_offset != expected_logical_offset:
-				raise MaterialProfileError("logical-mip-gap")
-			mip_width = max(1, width >> mip_index)
-			mip_height = max(1, height >> mip_index)
-			mip_depth = max(1, depth >> mip_index)
-			tight_pitch = max(1, (mip_width + unit_width - 1) // unit_width) * unit_bytes
-			row_count = max(1, (mip_height + unit_height - 1) // unit_height)
-			if pitch < tight_pitch or pitch % unit_bytes or logical_size != pitch * row_count:
-				raise MaterialProfileError("logical-mip-size-mismatch")
-			decoded_size = logical_size * mip_depth
-			physical_size, physical_relative = struct.unpack_from("<II", data, chunk_table_start + index * 8)
-			if physical_relative != expected_physical_relative:
-				raise MaterialProfileError("physical-chunk-gap")
-			physical_offset = payload_start + physical_relative
-			physical_start, physical_end = runtime._materialCheckedRange(data, physical_offset, physical_size, "physical-chunk")
-			if physical_size == decoded_size:
-				codec = "raw"
-			elif physical_size >= 4 and data[physical_start:physical_start + 2] == b"\x04\xFB":
-				codec = "gdeflate"
-			else:
-				raise MaterialProfileError("gdeflate-signature-mismatch")
-			mips.append({
-				"index": index,
-				"image_index": image_index,
-				"mip_index": mip_index,
-				"width": mip_width,
-				"height": mip_height,
-				"depth": mip_depth,
-				"logical_offset": logical_offset,
-				"pitch": pitch,
-				"tight_pitch": tight_pitch,
-				"row_count": row_count,
-				"logical_size": logical_size,
-				"decoded_size": decoded_size,
-				"physical_offset": physical_start,
-				"physical_size": physical_size,
-				"physical_end": physical_end,
-				"codec": codec,
-			})
-			expected_logical_offset += decoded_size
-			expected_physical_relative += physical_size
-		if payload_start + expected_physical_relative != len(data):
-			raise MaterialProfileError("physical-payload-tail")
-		return {
-			"version": version,
-			"width": width,
-			"height": height,
-			"depth": depth,
-			"image_count": image_count,
-			"mip_count": mip_count,
-			"format": format_code,
-			"swizzle": swizzle,
-			"cubemap": cubemap == 4,
-			"payload_offset": payload_start,
-			"mips": mips,
-		}
-
-	def decodePragmataTexMips(data, profile, decoder):
-		decoded = []
-		for mip in profile["mips"]:
-			start, end = runtime._materialCheckedRange(data, mip["physical_offset"], mip["physical_size"], "physical-chunk")
-			chunk = bytes(data[start:end])
-			if mip["codec"] == "raw":
-				output = chunk
-			elif mip["codec"] == "gdeflate":
-				output = decoder(chunk, mip["decoded_size"])
-			else:
-				raise MaterialProfileError("unsupported-mip-codec")
-			if not isinstance(output, bytes) or len(output) != mip["decoded_size"]:
-				raise MaterialProfileError("decoded-mip-size-mismatch")
-			decoded.append(output)
-		return decoded
-
-	def preparePragmataTexSurface(decodedMip, mip):
-		if not isinstance(decodedMip, bytes) or len(decodedMip) != mip["decoded_size"]:
-			raise MaterialProfileError("decoded-mip-size-mismatch")
-		logical_size = mip["logical_size"]
-		pitch = mip["pitch"]
-		tight_pitch = mip["tight_pitch"]
-		row_count = mip["row_count"]
-		if logical_size != pitch * row_count or tight_pitch > pitch:
+def parsePragmataTexProfile(data, path):
+	if not path.lower().endswith((".tex" + formats["PRAGMATA"]["texExt"])):
+		raise MaterialProfileError("tex-suffix-mismatch")
+	_materialCheckedRange(data, 0, 0x28, "tex-header")
+	if data[0:4] != b"TEX\0":
+		raise MaterialProfileError("tex-magic-mismatch")
+	version = _materialScalar(data, 4, "<I", "tex-version")
+	if version != formats["PRAGMATA"]["texVersion"]:
+		raise MaterialProfileError("tex-version-mismatch")
+	width, height, depth = struct.unpack_from("<HHH", data, 8)
+	image_count = data[0x0E]
+	mip_table_size = data[0x0F]
+	format_code = _materialScalar(data, 0x10, "<I", "tex-format")
+	swizzle = _materialScalar(data, 0x14, "<i", "tex-swizzle")
+	cubemap = _materialScalar(data, 0x18, "<I", "tex-cubemap")
+	if width <= 0 or height <= 0 or depth <= 0 or image_count <= 0:
+		raise MaterialProfileError("tex-shape-mismatch")
+	if cubemap not in (0, 4) or (cubemap == 4 and image_count != 6):
+		raise MaterialProfileError("tex-shape-mismatch")
+	if depth > 1 and (image_count != 1 or cubemap != 0):
+		raise MaterialProfileError("tex-shape-mismatch")
+	format_layout = texFormatLayouts.get(format_code)
+	if format_layout is None:
+		raise MaterialProfileError("tex-format-mismatch")
+	unit_width, unit_height, unit_bytes = format_layout
+	if mip_table_size <= 0 or mip_table_size % 16:
+		raise MaterialProfileError("mip-table-size-mismatch")
+	mip_count = mip_table_size // 16
+	entry_count = image_count * mip_count
+	mip_table_start = 0x28
+	mip_table_byte_size = entry_count * 16
+	mip_table_end = mip_table_start + mip_table_byte_size
+	_materialCheckedRange(data, mip_table_start, mip_table_byte_size, "mip-table")
+	chunk_table_start = mip_table_end
+	chunk_table_size = entry_count * 8
+	_materialCheckedRange(data, chunk_table_start, chunk_table_size, "physical-chunk-table")
+	payload_start = chunk_table_start + chunk_table_size
+	expected_logical_offset = mip_table_end
+	expected_physical_relative = 0
+	mips = []
+	for index in range(entry_count):
+		image_index = index // mip_count
+		mip_index = index % mip_count
+		logical_offset, pitch, logical_size = struct.unpack_from("<QII", data, mip_table_start + index * 16)
+		if logical_offset != expected_logical_offset:
+			raise MaterialProfileError("logical-mip-gap")
+		mip_width = max(1, width >> mip_index)
+		mip_height = max(1, height >> mip_index)
+		mip_depth = max(1, depth >> mip_index)
+		tight_pitch = max(1, (mip_width + unit_width - 1) // unit_width) * unit_bytes
+		row_count = max(1, (mip_height + unit_height - 1) // unit_height)
+		if pitch < tight_pitch or pitch % unit_bytes or logical_size != pitch * row_count:
 			raise MaterialProfileError("logical-mip-size-mismatch")
-		first_slice = decodedMip[:logical_size]
-		if pitch == tight_pitch:
-			return first_slice
-		return b"".join(
-			first_slice[row * pitch:row * pitch + tight_pitch]
-			for row in range(row_count)
-		)
+		decoded_size = logical_size * mip_depth
+		physical_size, physical_relative = struct.unpack_from("<II", data, chunk_table_start + index * 8)
+		if physical_relative != expected_physical_relative:
+			raise MaterialProfileError("physical-chunk-gap")
+		physical_offset = payload_start + physical_relative
+		physical_start, physical_end = _materialCheckedRange(data, physical_offset, physical_size, "physical-chunk")
+		if physical_size == decoded_size:
+			codec = "raw"
+		elif physical_size >= 4 and data[physical_start:physical_start + 2] == b"\x04\xFB":
+			codec = "gdeflate"
+		else:
+			raise MaterialProfileError("gdeflate-signature-mismatch")
+		mips.append({
+			"index": index,
+			"image_index": image_index,
+			"mip_index": mip_index,
+			"width": mip_width,
+			"height": mip_height,
+			"depth": mip_depth,
+			"logical_offset": logical_offset,
+			"pitch": pitch,
+			"tight_pitch": tight_pitch,
+			"row_count": row_count,
+			"logical_size": logical_size,
+			"decoded_size": decoded_size,
+			"physical_offset": physical_start,
+			"physical_size": physical_size,
+			"physical_end": physical_end,
+			"codec": codec,
+		})
+		expected_logical_offset += decoded_size
+		expected_physical_relative += physical_size
+	if payload_start + expected_physical_relative != len(data):
+		raise MaterialProfileError("physical-payload-tail")
+	return {
+		"version": version,
+		"width": width,
+		"height": height,
+		"depth": depth,
+		"image_count": image_count,
+		"mip_count": mip_count,
+		"format": format_code,
+		"swizzle": swizzle,
+		"cubemap": cubemap == 4,
+		"payload_offset": payload_start,
+		"mips": mips,
+	}
 
+def decodePragmataTexMips(data, profile, decoder):
+	decoded = []
+	for mip in profile["mips"]:
+		start, end = _materialCheckedRange(data, mip["physical_offset"], mip["physical_size"], "physical-chunk")
+		chunk = bytes(data[start:end])
+		if mip["codec"] == "raw":
+			output = chunk
+		elif mip["codec"] == "gdeflate":
+			output = decoder(chunk, mip["decoded_size"])
+		else:
+			raise MaterialProfileError("unsupported-mip-codec")
+		if not isinstance(output, bytes) or len(output) != mip["decoded_size"]:
+			raise MaterialProfileError("decoded-mip-size-mismatch")
+		decoded.append(output)
+	return decoded
+
+def preparePragmataTexSurface(decodedMip, mip):
+	if not isinstance(decodedMip, bytes) or len(decodedMip) != mip["decoded_size"]:
+		raise MaterialProfileError("decoded-mip-size-mismatch")
+	logical_size = mip["logical_size"]
+	pitch = mip["pitch"]
+	tight_pitch = mip["tight_pitch"]
+	row_count = mip["row_count"]
+	if logical_size != pitch * row_count or tight_pitch > pitch:
+		raise MaterialProfileError("logical-mip-size-mismatch")
+	first_slice = decodedMip[:logical_size]
+	if pitch == tight_pitch:
+		return first_slice
+	return b"".join(
+		first_slice[row * pitch:row * pitch + tight_pitch]
+		for row in range(row_count)
+	)
+
+
+def appendTextureSurface(texture_type, pixel_type, textures, surface):
+	"""Construct one decoded surface; naming/dimensions stay with its format."""
+	name, width, height, pixels = surface
+	texture = texture_type(name, width, height, pixels, pixel_type)
+	textures.append(texture)
+	return texture
+
+
+def bind(runtime):
 	def texCheckType(data):
 		bs = runtime.NoeBitStream(data)
 		magic = bs.readUInt()
@@ -269,8 +277,8 @@ def bind(runtime):
 					if runtime.bImportMips and profile["mip_count"] > 1:
 						nameRoot, nameExt = os.path.splitext(imageName)
 						imageName = nameRoot + "_mip_" + str(mip["mip_index"]) + nameExt
-					tex = runtime.NoeTexture(imageName, mip["width"], mip["height"], texData, runtime.noesis.NOESISTEX_RGBA32)
-					texList.append(tex)
+					tex = appendTextureSurface(runtime.NoeTexture, runtime.noesis.NOESISTEX_RGBA32,
+						texList, (imageName, mip["width"], mip["height"], texData))
 				fmtName = texFormatNames.get(profile["format"], str(profile["format"]))
 				print("PRAGMATA TEX profile:", profile["width"], "x", profile["height"], "x", profile["depth"], fmtName + ",", profile["image_count"], "images,", profile["mip_count"], "mips")
 				return tex
@@ -283,10 +291,7 @@ def bind(runtime):
 		width = bs.readUShort()
 		height = bs.readUShort()
 		unk00 = bs.readUShort()
-		if version == 190820018:
-			version = 10
-		if version == 143221013:
-			version = 36
+		version = runtime.convertTexVersion(version)
 		
 		if version > 27:
 			numImages = bs.readUByte()
@@ -343,8 +348,8 @@ def bind(runtime):
 				if texData == 0:
 					return 0
 				
-				tex = runtime.NoeTexture(texName, int(mipWidth), int(mipHeight), texData, texFormat)
-				texList.append(tex)
+				tex = appendTextureSurface(runtime.NoeTexture, texFormat,
+					texList, (texName, int(mipWidth), int(mipHeight), texData))
 				
 				if not runtime.bImportMips:
 					break

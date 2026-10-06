@@ -15,9 +15,7 @@ from re_engine_types import (
 
 # Host/state/callback dependencies (resolved on use, never copied).
 RUNTIME_DEPENDENCIES = (
-	'BBskipBytes',
 	'GetRootGameDir',
-	'LOD1OffsetLocation',
 	'LoadExtractedDir',
 	'NoeBitStream',
 	'NoeBone',
@@ -48,30 +46,77 @@ RUNTIME_DEPENDENCIES = (
 	'bTANGsEnabled',
 	'bUVsEnabled',
 	'bUseOldNamingScheme',
-	'bonesOffsLocation',
-	'bsHdrOffLocation',
-	'bsIndicesOffLocation',
 	'cleanBoneName',
 	'dialogOptions',
 	'extractedNativesPath',
 	'fDefaultMeshScale',
 	'feedPragmataMorphFrames',
-	'floatsHdrOffsLocation',
 	'hash_wide',
 	'isMeshVer3',
 	'loadPragmataStreamingCompanion',
-	'namesOffsLocation',
-	'nodesIndicesOffsLocation',
 	'noesis',
-	'normalsRecalcOffsLocation',
-	'numNodesLocation',
 	'rapi',
 	'readUIntAt',
 	'sGameName',
 	'sInputName',
 	'setOffsets',
-	'vBuffHdrOffsLocation',
 )
+
+
+def getLegacyMeshLayout(ver, game_name):
+	# Per-import layout; writer compatibility publishes a separate copy.
+	layout = {}
+	layout["BBskipBytes"] = 				8 	if ver == 1 else 0
+	layout["numNodesLocation"] = 			18 	if ver < 3 else 20
+	layout["LOD1OffsetLocation"] = 		24 	if ver < 3 else 32
+	layout["bsHdrOffLocation"] = 			64 	if ver < 3 else 56
+	layout["normalsRecalcOffsLocation"] = 56 	if ver < 3 else 64
+	layout["vBuffHdrOffsLocation"] = 		80 	if ver < 3 else 72
+	layout["floatsHdrOffsLocation"] = 	72 	if ver < 3 else 96
+	layout["bonesOffsLocation"] = 		48 	if ver < 3 else 104
+	layout["nodesIndicesOffsLocation"] = 	96 	if ver < 3 else 112
+	layout["bsIndicesOffLocation"] = 		112 if ver < 3 else 128
+	layout["namesOffsLocation"] = 		120 if ver < 3 else 144
+
+	if game_name == "AJ_AAT" or game_name == "DD2" or game_name == "DRDR":
+		layout["namesOffsLocation"] = 136 # on unrigged meshes its still 144
+
+	return layout
+
+
+def bindMeshVertexStreams(rapi, streams):
+	"""Consume format-prepared streams in order, without copying their buffers."""
+	methods = {
+		"position": "rpgBindPositionBufferOfs",
+		"normal": "rpgBindNormalBufferOfs",
+		"tangent": "rpgBindTangentBufferOfs",
+		"uv_scale_bias": "rpgSetUVScaleBias",
+		"uv1": "rpgBindUV1BufferOfs",
+		"uv2": "rpgBindUV2BufferOfs",
+		"bone_map": "rpgSetBoneMap",
+		"bone_indices": "rpgBindBoneIndexBufferOfs",
+		"bone_weights": "rpgBindBoneWeightBufferOfs",
+		"color": "rpgBindColorBufferOfs",
+	}
+	for semantic, arguments in streams:
+		if semantic == "uv_scale_bias_fallback":
+			# Legacy catches host failures as well as missing material UV metadata.
+			try:
+				rapi.rpgSetUVScaleBias(*arguments[0])
+			except:
+				rapi.rpgSetUVScaleBias(*arguments[1]())
+		else:
+			getattr(rapi, methods[semantic])(*arguments)
+
+
+def submitMeshPrimitive(rapi, noesis, primitive):
+	"""Submit prepared indices without changing format-specific point/clear policy."""
+	rapi.rpgCommitTriangles(
+		None if primitive["points"] else primitive["indices"],
+		noesis.RPGEODATA_USHORT if primitive["index_width"] == 2 else noesis.RPGEODATA_UINT,
+		primitive["count"], noesis.RPGEO_POINTS if primitive["points"] else noesis.RPGEO_TRIANGLE, 0x1)
+	if primitive["clear_binds"]:
+		rapi.rpgClearBufferBinds()
 
 
 def bind(runtime):
@@ -113,21 +158,9 @@ def bind(runtime):
 		return names
 
 	def setOffsets(ver):
-		# Shared state is owned by runtime.
-		runtime.BBskipBytes = 				8 	if ver == 1 else 0
-		runtime.numNodesLocation = 			18 	if ver < 3 else 20
-		runtime.LOD1OffsetLocation = 		24 	if ver < 3 else 32
-		runtime.bsHdrOffLocation = 			64 	if ver < 3 else 56
-		runtime.normalsRecalcOffsLocation = 56 	if ver < 3 else 64
-		runtime.vBuffHdrOffsLocation = 		80 	if ver < 3 else 72
-		runtime.floatsHdrOffsLocation = 	72 	if ver < 3 else 96
-		runtime.bonesOffsLocation = 		48 	if ver < 3 else 104
-		runtime.nodesIndicesOffsLocation = 	96 	if ver < 3 else 112
-		runtime.bsIndicesOffLocation = 		112 if ver < 3 else 128
-		runtime.namesOffsLocation = 		120 if ver < 3 else 144
-
-		if runtime.sGameName == "AJ_AAT" or runtime.sGameName == "DD2" or runtime.sGameName == "DRDR":
-			runtime.namesOffsLocation = 136 # on unrigged meshes its still 144
+		# Compatibility facade for existing writer/entry callers.
+		for name, value in getLegacyMeshLayout(ver, runtime.sGameName).items():
+			setattr(runtime, name, value)
 
 	def findGameName(number, formatsKey):
 		for gameName, dictionary in formats.items():
@@ -163,6 +196,7 @@ def bind(runtime):
 			self.setGameName()
 			self.gameName = runtime.sGameName
 			self.ver = formats[runtime.sGameName]["meshVersion"]
+			self.layout = getLegacyMeshLayout(self.ver, self.gameName)
 			self.mdfVer = formats[runtime.sGameName]["mdfVersion"]
 			self.name = "LOD" if runtime.bShorterNames else "LODGroup"
 			self.meshFile = None
@@ -303,47 +337,28 @@ def bind(runtime):
 					(runtime.fDefaultMeshScale, runtime.fDefaultMeshScale, runtime.fDefaultMeshScale), (0, 0, 0)
 				)
 
-				vertex_start = submesh["vertex_start"]
-				position = vertex_elements[0]
-				runtime.rapi.rpgBindPositionBufferOfs(
-					vertex_buffer, runtime.noesis.RPGEODATA_FLOAT, position["stride"],
-					position["offset"] + position["stride"] * vertex_start
-				)
-				if runtime.bNORMsEnabled:
-					normal = vertex_elements[1]
-					normal_offset = normal["offset"] + normal["stride"] * vertex_start
-					runtime.rapi.rpgBindNormalBufferOfs(
-						vertex_buffer, runtime.noesis.RPGEODATA_BYTE, normal["stride"], normal_offset
-					)
-					if runtime.bTANGsEnabled:
-						runtime.rapi.rpgBindTangentBufferOfs(
-							vertex_buffer, runtime.noesis.RPGEODATA_BYTE, normal["stride"], normal_offset + 4
-						)
-				if runtime.bUVsEnabled:
-					uv = vertex_elements[2]
-					runtime.rapi.rpgSetUVScaleBias(runtime.NoeVec3((1, 1, 1)), runtime.NoeVec3((0, 0, 0)))
-					runtime.rapi.rpgBindUV1BufferOfs(
-						vertex_buffer, runtime.noesis.RPGEODATA_HALFFLOAT, uv["stride"],
-						uv["offset"] + uv["stride"] * vertex_start
-					)
-				if runtime.bSkinningEnabled and 4 in vertex_elements:
-					runtime.rapi.rpgSetBoneMap(self.fullRemapTable)
-					runtime.rapi.rpgBindBoneIndexBufferOfs(
-						bone_index_buffer, runtime.noesis.RPGEODATA_USHORT,
-						bone_weight_count * 2, vertex_start * bone_weight_count * 2,
-						bone_weight_count
-					)
-					runtime.rapi.rpgBindBoneWeightBufferOfs(
-						bone_weight_buffer, runtime.noesis.RPGEODATA_UBYTE,
-						bone_weight_count, vertex_start * bone_weight_count,
-						bone_weight_count
-					)
-				if runtime.bColorsEnabled and 5 in vertex_elements:
-					color = vertex_elements[5]
-					runtime.rapi.rpgBindColorBufferOfs(
-						vertex_buffer, runtime.noesis.RPGEODATA_UBYTE, color["stride"],
-						color["offset"] + color["stride"] * vertex_start, 4
-					)
+				def profileVertexStreams():
+					vertex_start = submesh["vertex_start"]
+					position = vertex_elements[0]
+					yield ("position", (vertex_buffer, runtime.noesis.RPGEODATA_FLOAT, position["stride"], position["offset"] + position["stride"] * vertex_start,))
+					if runtime.bNORMsEnabled:
+						normal = vertex_elements[1]
+						normal_offset = normal["offset"] + normal["stride"] * vertex_start
+						yield ("normal", (vertex_buffer, runtime.noesis.RPGEODATA_BYTE, normal["stride"], normal_offset,))
+						if runtime.bTANGsEnabled:
+							yield ("tangent", (vertex_buffer, runtime.noesis.RPGEODATA_BYTE, normal["stride"], normal_offset + 4,))
+					if runtime.bUVsEnabled:
+						uv = vertex_elements[2]
+						yield ("uv_scale_bias", (runtime.NoeVec3((1, 1, 1)), runtime.NoeVec3((0, 0, 0)),))
+						yield ("uv1", (vertex_buffer, runtime.noesis.RPGEODATA_HALFFLOAT, uv["stride"], uv["offset"] + uv["stride"] * vertex_start,))
+					if runtime.bSkinningEnabled and 4 in vertex_elements:
+						yield ("bone_map", (self.fullRemapTable,))
+						yield ("bone_indices", (bone_index_buffer, runtime.noesis.RPGEODATA_USHORT, bone_weight_count * 2, vertex_start * bone_weight_count * 2, bone_weight_count,))
+						yield ("bone_weights", (bone_weight_buffer, runtime.noesis.RPGEODATA_UBYTE, bone_weight_count, vertex_start * bone_weight_count, bone_weight_count,))
+					if runtime.bColorsEnabled and 5 in vertex_elements:
+						color = vertex_elements[5]
+						yield ("color", (vertex_buffer, runtime.noesis.RPGEODATA_UBYTE, color["stride"], color["offset"] + color["stride"] * vertex_start, 4,))
+				bindMeshVertexStreams(runtime.rapi, profileVertexStreams())
 
 				morph_names = runtime.feedPragmataMorphFrames(
 					submesh, parsed["positions"], parsed.get("blend_shapes", []))
@@ -358,20 +373,14 @@ def bind(runtime):
 					}, sort_keys=True, separators=(",", ":")))
 
 				if runtime.bRenderAsPoints:
-					runtime.rapi.rpgCommitTriangles(
-						None, runtime.noesis.RPGEODATA_USHORT, submesh["vertex_count"],
-						runtime.noesis.RPGEO_POINTS, 0x1
-					)
+					primitive = {"indices": None, "index_width": 2,
+						"count": submesh["vertex_count"], "points": True, "clear_binds": True}
 				else:
 					index_buffer, index_width = runtime._pragmataNoesisIndexSubmission(
 						submesh, self.capability)
-					runtime.rapi.rpgCommitTriangles(
-						index_buffer,
-						(runtime.noesis.RPGEODATA_UINT if index_width == 4 else
-							runtime.noesis.RPGEODATA_USHORT),
-						submesh["index_count"], runtime.noesis.RPGEO_TRIANGLE, 0x1
-					)
-				runtime.rapi.rpgClearBufferBinds()
+					primitive = {"indices": index_buffer, "index_width": index_width,
+						"count": submesh["index_count"], "points": False, "clear_binds": True}
+				submitMeshPrimitive(runtime.rapi, runtime.noesis, primitive)
 
 			self.importStats = parsed["stats"]
 			return 1
@@ -399,22 +408,22 @@ def bind(runtime):
 			deferredWarning = ""
 			bDoSkin = True
 
-			bs.seek(runtime.numNodesLocation)
+			bs.seek(self.layout["numNodesLocation"])
 			numNodes = bs.readUInt()
-			bs.seek(runtime.LOD1OffsetLocation)
+			bs.seek(self.layout["LOD1OffsetLocation"])
 			LOD1Offs = bs.readUInt64()
 			LOD2Offs = bs.readUInt64()
 			occluderMeshOffs = bs.readUInt64()
-			bs.seek(runtime.vBuffHdrOffsLocation)
+			bs.seek(self.layout["vBuffHdrOffsLocation"])
 			vBuffHdrOffs = bs.readUInt64()
-			bs.seek(runtime.bonesOffsLocation)
+			bs.seek(self.layout["bonesOffsLocation"])
 			bonesOffs = bs.readUInt64()
-			bs.seek(runtime.nodesIndicesOffsLocation)
+			bs.seek(self.layout["nodesIndicesOffsLocation"])
 			nodesIndicesOffs = bs.readUInt64()
 			boneIndicesOffs = bs.readUInt64()
 			#if sGameName == "AJ_AAT" or sGameName == "DD2":
 			#	namesOffsLocation = 136 if bonesOffs > 0 else 144
-			bs.seek(runtime.namesOffsLocation)
+			bs.seek(self.layout["namesOffsLocation"])
 			namesOffs = bs.readUInt64()
 
 			if LOD1Offs:
@@ -657,8 +666,6 @@ def bind(runtime):
 
 						for k in range(meshVertexInfo[j][1]): # Submeshes
 
-							mainMeshNo = self.groupIDs[len(self.groupIDs)-1] if runtime.bReadGroupIds else j+1
-							mainMeshStr = "_Group_" if runtime.bReadGroupIds else "_MainMesh_" if not runtime.bShorterNames else "_Main_"
 
 							materialID = submeshData[k][0]
 							uknSubmeshID = submeshData[k][1]
@@ -716,80 +723,81 @@ def bind(runtime):
 								#rapi.rpgSetName(meshName + "__" + matName + "__" + str(submeshData[k][len(submeshData[k])-1]))
 								runtime.rapi.rpgSetName(meshName + '__' + matName)
 
-							if positionIndex != -1:
-								if self.pos: #position offset
-									posList = []
-									for v in range(vertsBefore, vertsBefore+numVerts):
-										idx = 12 * v
-										transVec = runtime.NoeVec3(((struct.unpack_from('f', vertexBuffer, idx))[0], (struct.unpack_from('f', vertexBuffer, idx + 4))[0], (struct.unpack_from('f', vertexBuffer, idx + 8))[0])) * self.rot.transpose()
-										posList.append(transVec[0] + self.pos[0])
-										posList.append(transVec[1] + self.pos[1])
-										posList.append(transVec[2] + self.pos[2])
-									posBuff = struct.pack("<" + 'f'*len(posList), *posList)
-									runtime.rapi.rpgBindPositionBufferOfs(posBuff, runtime.noesis.RPGEODATA_FLOAT, 12, 0)
-								else:
-									runtime.rapi.rpgBindPositionBufferOfs(vertexBuffer, runtime.noesis.RPGEODATA_FLOAT, vertElemHeaders[positionIndex][1], (vertElemHeaders[positionIndex][1] * vertsBefore))
+							def legacyVertexStreams():
+								if positionIndex != -1:
+									if self.pos: #position offset
+										posList = []
+										for v in range(vertsBefore, vertsBefore+numVerts):
+											idx = 12 * v
+											transVec = runtime.NoeVec3(((struct.unpack_from('f', vertexBuffer, idx))[0], (struct.unpack_from('f', vertexBuffer, idx + 4))[0], (struct.unpack_from('f', vertexBuffer, idx + 8))[0])) * self.rot.transpose()
+											posList.append(transVec[0] + self.pos[0])
+											posList.append(transVec[1] + self.pos[1])
+											posList.append(transVec[2] + self.pos[2])
+										posBuff = struct.pack("<" + 'f'*len(posList), *posList)
+										yield ("position", (posBuff, runtime.noesis.RPGEODATA_FLOAT, 12, 0,))
+									else:
+										yield ("position", (vertexBuffer, runtime.noesis.RPGEODATA_FLOAT, vertElemHeaders[positionIndex][1], vertElemHeaders[positionIndex][1] * vertsBefore,))
 
-							if normalIndex != -1 and runtime.bNORMsEnabled:
-								if runtime.bDebugNormals and not runtime.bColorsEnabled:
-									runtime.rapi.rpgBindColorBufferOfs(vertexBuffer, runtime.noesis.RPGEODATA_BYTE, vertElemHeaders[normalIndex][1], vertElemHeaders[normalIndex][2] + (vertElemHeaders[normalIndex][1] * vertsBefore), 4)
-								else:
-									runtime.rapi.rpgBindNormalBufferOfs(vertexBuffer, runtime.noesis.RPGEODATA_BYTE, vertElemHeaders[normalIndex][1], vertElemHeaders[normalIndex][2] + (vertElemHeaders[normalIndex][1] * vertsBefore))
-									if runtime.bTANGsEnabled:
-										runtime.rapi.rpgBindTangentBufferOfs(vertexBuffer, runtime.noesis.RPGEODATA_BYTE, vertElemHeaders[normalIndex][1], 4 + vertElemHeaders[normalIndex][2] + (vertElemHeaders[normalIndex][1] * vertsBefore))
-							try:
-								runtime.rapi.rpgSetUVScaleBias(runtime.NoeVec3((self.uvBias[names[nameRemapTable[materialID]]][0], 1, 1)), runtime.NoeVec3((self.uvBias[names[nameRemapTable[materialID]]][1], 0, 0)))
-							except:
-								runtime.rapi.rpgSetUVScaleBias(runtime.NoeVec3((1,1,1)), runtime.NoeVec3((0,0,0)))
-							if uvIndex != -1 and runtime.bUVsEnabled:
-								runtime.rapi.rpgBindUV1BufferOfs(vertexBuffer, runtime.noesis.RPGEODATA_HALFFLOAT, vertElemHeaders[uvIndex][1], vertElemHeaders[uvIndex][2] + (vertElemHeaders[uvIndex][1] * vertsBefore))
-							if uv2Index != -1 and runtime.bUVsEnabled:
-								runtime.rapi.rpgBindUV2BufferOfs(vertexBuffer, runtime.noesis.RPGEODATA_HALFFLOAT, vertElemHeaders[uv2Index][1], vertElemHeaders[uv2Index][2] + (vertElemHeaders[uv2Index][1] * vertsBefore))
+								if normalIndex != -1 and runtime.bNORMsEnabled:
+									if runtime.bDebugNormals and not runtime.bColorsEnabled:
+										yield ("color", (vertexBuffer, runtime.noesis.RPGEODATA_BYTE, vertElemHeaders[normalIndex][1], vertElemHeaders[normalIndex][2] + (vertElemHeaders[normalIndex][1] * vertsBefore), 4,))
+									else:
+										yield ("normal", (vertexBuffer, runtime.noesis.RPGEODATA_BYTE, vertElemHeaders[normalIndex][1], vertElemHeaders[normalIndex][2] + (vertElemHeaders[normalIndex][1] * vertsBefore),))
+										if runtime.bTANGsEnabled:
+											yield ("tangent", (vertexBuffer, runtime.noesis.RPGEODATA_BYTE, vertElemHeaders[normalIndex][1], 4 + vertElemHeaders[normalIndex][2] + (vertElemHeaders[normalIndex][1] * vertsBefore),))
+								try:
+									uv_stream = ("uv_scale_bias_fallback", ((runtime.NoeVec3((self.uvBias[names[nameRemapTable[materialID]]][0], 1, 1)), runtime.NoeVec3((self.uvBias[names[nameRemapTable[materialID]]][1], 0, 0))), lambda: (runtime.NoeVec3((1,1,1)), runtime.NoeVec3((0,0,0)))))
+								except:
+									uv_stream = ("uv_scale_bias", (runtime.NoeVec3((1,1,1)), runtime.NoeVec3((0,0,0)),))
+								yield uv_stream
+								if uvIndex != -1 and runtime.bUVsEnabled:
+									yield ("uv1", (vertexBuffer, runtime.noesis.RPGEODATA_HALFFLOAT, vertElemHeaders[uvIndex][1], vertElemHeaders[uvIndex][2] + (vertElemHeaders[uvIndex][1] * vertsBefore),))
+								if uv2Index != -1 and runtime.bUVsEnabled:
+									yield ("uv2", (vertexBuffer, runtime.noesis.RPGEODATA_HALFFLOAT, vertElemHeaders[uv2Index][1], vertElemHeaders[uv2Index][2] + (vertElemHeaders[uv2Index][1] * vertsBefore),))
 
-							if weightIndex != -1 and runtime.bSkinningEnabled and bDoSkin:
-								#rapi.rpgSetBoneMap(boneRemapTable)
-								runtime.rapi.rpgSetBoneMap(self.fullRemapTable)
-								idxList = []
-								start = vertexStartIndex + vertElemHeaders[weightIndex][2] + (vertElemHeaders[weightIndex][1] * vertsBefore)
-								if runtime.sGameName == "SF6":
-									for v in range(numVerts):
-										bs.seek(start + vertElemHeaders[weightIndex][1] * v)
-										for bID in range(3):
-											idxList.append(bs.readBits(10)+fullRemapOffs)
-										bs.readBits(2)
-										for bID in range(3):
-											idxList.append(bs.readBits(10)+fullRemapOffs)
-										idxList.extend([0,0])
-									idxBuff = struct.pack("<" + 'H'*len(idxList), *idxList)
-									runtime.rapi.rpgBindBoneIndexBufferOfs(idxBuff, runtime.noesis.RPGEODATA_USHORT, 16, 0, 8)
-								elif fullBonesOffs:
-									for v in range(numVerts):
-										bs.seek(start + vertElemHeaders[weightIndex][1] * v)
-										for w in range(8):
-											idxList.append(bs.readUByte()+fullRemapOffs)
-									idxBuff = struct.pack("<" + 'H'*len(idxList), *idxList)
-									runtime.rapi.rpgBindBoneIndexBufferOfs(idxBuff, runtime.noesis.RPGEODATA_USHORT, 16, 0, 8)
-								else:
-									runtime.rapi.rpgBindBoneIndexBufferOfs(vertexBuffer, runtime.noesis.RPGEODATA_UBYTE, vertElemHeaders[weightIndex][1], vertElemHeaders[weightIndex][2] + (vertElemHeaders[weightIndex][1] * vertsBefore), 8)
-								runtime.rapi.rpgBindBoneWeightBufferOfs(vertexBuffer, runtime.noesis.RPGEODATA_UBYTE, vertElemHeaders[weightIndex][1], vertElemHeaders[weightIndex][2] + (vertElemHeaders[weightIndex][1] * vertsBefore) + 8, 8)
+								if weightIndex != -1 and runtime.bSkinningEnabled and bDoSkin:
+									#rapi.rpgSetBoneMap(boneRemapTable)
+									yield ("bone_map", (self.fullRemapTable,))
+									idxList = []
+									start = vertexStartIndex + vertElemHeaders[weightIndex][2] + (vertElemHeaders[weightIndex][1] * vertsBefore)
+									if runtime.sGameName == "SF6":
+										for v in range(numVerts):
+											bs.seek(start + vertElemHeaders[weightIndex][1] * v)
+											for bID in range(3):
+												idxList.append(bs.readBits(10)+fullRemapOffs)
+											bs.readBits(2)
+											for bID in range(3):
+												idxList.append(bs.readBits(10)+fullRemapOffs)
+											idxList.extend([0,0])
+										idxBuff = struct.pack("<" + 'H'*len(idxList), *idxList)
+										yield ("bone_indices", (idxBuff, runtime.noesis.RPGEODATA_USHORT, 16, 0, 8,))
+									elif fullBonesOffs:
+										for v in range(numVerts):
+											bs.seek(start + vertElemHeaders[weightIndex][1] * v)
+											for w in range(8):
+												idxList.append(bs.readUByte()+fullRemapOffs)
+										idxBuff = struct.pack("<" + 'H'*len(idxList), *idxList)
+										yield ("bone_indices", (idxBuff, runtime.noesis.RPGEODATA_USHORT, 16, 0, 8,))
+									else:
+										yield ("bone_indices", (vertexBuffer, runtime.noesis.RPGEODATA_UBYTE, vertElemHeaders[weightIndex][1], vertElemHeaders[weightIndex][2] + (vertElemHeaders[weightIndex][1] * vertsBefore), 8,))
+									yield ("bone_weights", (vertexBuffer, runtime.noesis.RPGEODATA_UBYTE, vertElemHeaders[weightIndex][1], vertElemHeaders[weightIndex][2] + (vertElemHeaders[weightIndex][1] * vertsBefore) + 8, 8,))
 
-							if colorIndex != -1 and runtime.bColorsEnabled:
-								offs = vertElemHeaders[colorIndex][2] + (vertElemHeaders[colorIndex][1] * vertsBefore)
-								if offs + numVerts*4 < len(vertexBuffer):
-									runtime.rapi.rpgBindColorBufferOfs(vertexBuffer, runtime.noesis.RPGEODATA_UBYTE, vertElemHeaders[colorIndex][1], offs, 4)
-								else:
-									print("WARNING:", meshName, "Color buffer would have been read out of bounds by provided indices", "\n	Buffer Size:", len(vertexBuffer), "\n	Required Size:", offs + numVerts*4)
+								if colorIndex != -1 and runtime.bColorsEnabled:
+									offs = vertElemHeaders[colorIndex][2] + (vertElemHeaders[colorIndex][1] * vertsBefore)
+									if offs + numVerts*4 < len(vertexBuffer):
+										yield ("color", (vertexBuffer, runtime.noesis.RPGEODATA_UBYTE, vertElemHeaders[colorIndex][1], offs, 4,))
+									else:
+										print("WARNING:", meshName, "Color buffer would have been read out of bounds by provided indices", "\n	Buffer Size:", len(vertexBuffer), "\n	Required Size:", offs + numVerts*4)
+							bindMeshVertexStreams(runtime.rapi, legacyVertexStreams())
 
 							if numFaces > 0:
 								faceSize = 4 if intFaces == 1 else 2
 								bs.seek(faceBuffOffs + (facesBefore * faceSize))
 								indexBuffer = bs.readBytes(numFaces * faceSize)
-								if runtime.bRenderAsPoints:
-									runtime.rapi.rpgCommitTriangles(None, runtime.noesis.RPGEODATA_USHORT if faceSize == 2 else runtime.noesis.RPGEODATA_UINT, (meshVertexInfo[j][4] - (vertsBefore)), runtime.noesis.RPGEO_POINTS, 0x1)
-								else:
-									#rapi.rpgSetStripEnder(0x10000)
-									runtime.rapi.rpgCommitTriangles(indexBuffer, runtime.noesis.RPGEODATA_USHORT if faceSize == 2 else runtime.noesis.RPGEODATA_UINT, numFaces, runtime.noesis.RPGEO_TRIANGLE, 0x1)
-									runtime.rapi.rpgClearBufferBinds()
+								primitive = {"indices": indexBuffer, "index_width": faceSize,
+									"count": (meshVertexInfo[j][4] - vertsBefore) if runtime.bRenderAsPoints else numFaces,
+									"points": runtime.bRenderAsPoints, "clear_binds": not runtime.bRenderAsPoints}
+								submitMeshPrimitive(runtime.rapi, runtime.noesis, primitive)
 
 						numVertsLOD += meshVertexInfo[j][4]
 

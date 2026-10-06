@@ -19,7 +19,6 @@ RUNTIME_DEPENDENCIES = (
 	'NoeBone',
 	'NoeKeyFramedAnim',
 	'NoeKeyFramedBone',
-	'NoeKeyFramedValue',
 	'NoeModel',
 	'NoeQuat',
 	'NoeVec3',
@@ -41,6 +40,53 @@ RUNTIME_DEPENDENCIES = (
 	'rapi',
 	'sGameName',
 )
+
+
+def buildLocalBoneMatrix(rotation, translation, mesh_scale, local_scale=None):
+	matrix = rotation.toMat43()
+	if local_scale is not None:
+		matrix[0] = matrix[0] * local_scale[0]
+		matrix[1] = matrix[1] * local_scale[1]
+		matrix[2] = matrix[2] * local_scale[2]
+	matrix[3] = translation * mesh_scale
+	return matrix
+
+
+def setKeyFramedComponent(runtime, bone, kind, keys):
+	"""Build host keys from explicit times; adapters own units and value conversion."""
+	values = [runtime.NoeKeyFramedValue(time, value) for time, value in keys]
+	if kind == "translation":
+		bone.setTranslation(values, runtime.noesis.NOEKF_TRANSLATION_VECTOR_3)
+	elif kind == "rotation":
+		bone.setRotation(values, runtime.noesis.NOEKF_ROTATION_QUATERNION_4)
+	else:
+		bone.setScale(values, runtime.noesis.NOEKF_SCALE_VECTOR_3)
+
+
+class LegacyMotlistSelectionSource:
+	"""Legacy loading policy used by the same public selection window."""
+	def __init__(self, runtime):
+		self.runtime = runtime
+
+	def load(self, path):
+		return self.runtime.motlistFile(self.runtime.rapi.loadIntoByteArray(path), path)
+
+	def prepareSelection(self, pak, load_items, paths, loaded):
+		bones = pak.bones
+		total_frames = pak.totalFrames
+		model_bone_names = [bone.name for bone in bones]
+		for path in paths:
+			if ".motlist." in path.lower() and path not in loaded and self.runtime.rapi.checkFileExists(path):
+				loaded[path] = self.load(path)
+				loaded[path].bones = bones
+				loaded[path].readBoneHeaders(load_items)
+		for index, name in enumerate(load_items):
+			if name.find("[ALL] - ") == 0:
+				path = paths[index]
+				for motion in loaded[path].mots:
+					if motion.name not in load_items:
+						load_items.append(motion.name)
+						paths.append(path)
 
 
 def bind(runtime):
@@ -76,14 +122,10 @@ def bind(runtime):
 			parent_index = bone_data["parent_index"]
 			if parent_index is not None and parent_index >= index:
 				raise MeshProfileError("structural-profile-mismatch:bone-parent")
-			local_matrix = runtime.NoeQuat(
-				bone_data["local_rotation"]).transpose().toMat43()
-			local_scale = bone_data["local_scale"]
-			local_matrix[0] = local_matrix[0] * local_scale[0]
-			local_matrix[1] = local_matrix[1] * local_scale[1]
-			local_matrix[2] = local_matrix[2] * local_scale[2]
-			local_matrix[3] = runtime.NoeVec3(
-				bone_data["local_translation"]) * runtime.fDefaultMeshScale
+			local_matrix = buildLocalBoneMatrix(
+				runtime.NoeQuat(bone_data["local_rotation"]).transpose(),
+				runtime.NoeVec3(bone_data["local_translation"]),
+				runtime.fDefaultMeshScale, bone_data["local_scale"])
 			model_matrix = local_matrix
 			if parent_index is not None:
 				model_matrix = local_matrix * model_matrices[parent_index]
@@ -116,26 +158,18 @@ def bind(runtime):
 				keyframed_bone = runtime.NoeKeyFramedBone(bone_index)
 				keyframed_by_index[bone_index] = keyframed_bone
 				keyframed_bones.append(keyframed_bone)
-			values = []
-			for key_time, value in zip(track["times"], track["values"]):
-				if track["kind"] == "translation":
-					converted = runtime.NoeVec3(value) * runtime.fDefaultMeshScale
-				elif track["kind"] == "rotation":
-					converted = runtime.NoeQuat(value).transpose()
-				elif track["kind"] == "scale":
-					converted = runtime.NoeVec3(value)
-				else:
-					raise MeshProfileError("unsupported-track-kind:" + track["kind"])
-				values.append(runtime.NoeKeyFramedValue(
-					key_time / float(frame_rate), converted))
-			if track["kind"] == "translation":
-				keyframed_bone.setTranslation(
-					values, runtime.noesis.NOEKF_TRANSLATION_VECTOR_3)
-			elif track["kind"] == "rotation":
-				keyframed_bone.setRotation(
-					values, runtime.noesis.NOEKF_ROTATION_QUATERNION_4)
-			else:
-				keyframed_bone.setScale(values, runtime.noesis.NOEKF_SCALE_VECTOR_3)
+			def componentKeys():
+				for key_time, value in zip(track["times"], track["values"]):
+					if track["kind"] == "translation":
+						converted = runtime.NoeVec3(value) * runtime.fDefaultMeshScale
+					elif track["kind"] == "rotation":
+						converted = runtime.NoeQuat(value).transpose()
+					elif track["kind"] == "scale":
+						converted = runtime.NoeVec3(value)
+					else:
+						raise MeshProfileError("unsupported-track-kind:" + track["kind"])
+					yield (key_time / float(frame_rate), converted)
+			setKeyFramedComponent(runtime, keyframed_bone, track["kind"], componentKeys())
 		return keyframed_bones, skipped_external
 
 	def buildPragmataMotlist1057Model(data, path):

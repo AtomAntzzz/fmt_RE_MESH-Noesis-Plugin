@@ -28,199 +28,200 @@ def _new_material(material_type, name):
 	return material
 
 
+def _materialCheckedRange(data, start, size, label):
+	def materialRangeError(token):
+		prefix = "offset-out-of-bounds:"
+		if token.startswith(prefix):
+			token = token[len(prefix):] + "-out-of-bounds"
+		return MaterialProfileError(token)
+	return re_common.checked_range(data, start, size, label, materialRangeError)
+
+def _materialScalar(data, offset, fmt, label):
+	_materialCheckedRange(data, offset, struct.calcsize(fmt), label)
+	return re_common.read_scalar(data, offset, fmt, label, MaterialProfileError)
+
+def _materialUtf16z(data, offset, limit, label):
+	return re_common.read_utf16z(
+		data, offset, limit, label, MaterialProfileError)
+
+def parsePragmataMdf2Profile(data, path):
+	if not path.lower().endswith(formats["PRAGMATA"]["mdfExt"]):
+		raise MaterialProfileError("mdf2-suffix-mismatch")
+	_materialCheckedRange(data, 0, 0x10, "mdf2-header")
+	if data[0:4] != b"MDF\0":
+		raise MaterialProfileError("mdf2-magic-mismatch")
+	version = _materialScalar(data, 4, "<H", "mdf2-version")
+	material_count = _materialScalar(data, 6, "<H", "material-count")
+	if version != 1:
+		raise MaterialProfileError("mdf2-version-mismatch")
+	if material_count < 1:
+		raise MaterialProfileError("material-count-mismatch")
+	entries_end = 0x10 + material_count * MDF2_51_ENTRY_SIZE
+	_materialCheckedRange(data, 0x10, material_count * MDF2_51_ENTRY_SIZE, "material-entries")
+	entries = []
+	for material_index in range(material_count):
+		entry_offset = 0x10 + material_index * MDF2_51_ENTRY_SIZE
+		entries.append({
+			"index": material_index,
+			"name_offset": _materialScalar(data, entry_offset, "<Q", "material-name"),
+			"hash": _materialScalar(data, entry_offset + 0x08, "<I", "material-hash"),
+			"property_data_size": _materialScalar(data, entry_offset + 0x0C, "<I", "property-data-size"),
+			"property_count": _materialScalar(data, entry_offset + 0x10, "<I", "property-count"),
+			"texture_count": _materialScalar(data, entry_offset + 0x14, "<I", "texture-count"),
+			"shader_type": _materialScalar(data, entry_offset + 0x20, "<I", "shader-type"),
+			"alpha_flags_raw": _materialScalar(data, entry_offset + 0x28, "<I", "alpha-flags"),
+			"property_table_offset": _materialScalar(data, entry_offset + 0x3C, "<Q", "property-table"),
+			"texture_table_offset": _materialScalar(data, entry_offset + 0x44, "<Q", "texture-table"),
+			"first_material_name_offset": _materialScalar(data, entry_offset + 0x4C, "<Q", "first-material-name"),
+			"property_data_offset": _materialScalar(data, entry_offset + 0x54, "<Q", "property-data"),
+			"master_material_offset": _materialScalar(data, entry_offset + 0x5C, "<Q", "master-material"),
+			"trailing_raw": _materialScalar(data, entry_offset + 0x64, "<Q", "material-trailing"),
+		})
+	if material_count > 1 and entries[0]["texture_table_offset"] == 0x7C:
+		raise MaterialProfileError("material-count-mismatch")
+	if material_count == 1:
+		if entries[0]["texture_count"] != MDF2_51_EXACT_TEXTURE_COUNT:
+			raise MaterialProfileError("texture-count-mismatch")
+		if entries[0]["property_count"] != MDF2_51_EXACT_PROPERTY_COUNT:
+			raise MaterialProfileError("property-count-mismatch")
+		_materialCheckedRange(data, entries[0]["texture_table_offset"], entries[0]["texture_count"] * MDF2_51_TEXTURE_ENTRY_SIZE, "texture-table")
+	expected_offset = entries_end
+	for entry in entries:
+		if entry["texture_table_offset"] != expected_offset:
+			raise MaterialProfileError("texture-table-chain-mismatch")
+		_materialCheckedRange(data, expected_offset, entry["texture_count"] * MDF2_51_TEXTURE_ENTRY_SIZE, "texture-table")
+		expected_offset += entry["texture_count"] * MDF2_51_TEXTURE_ENTRY_SIZE
+	for entry in entries:
+		if entry["property_table_offset"] != expected_offset:
+			raise MaterialProfileError("property-table-chain-mismatch")
+		_materialCheckedRange(data, expected_offset, entry["property_count"] * MDF2_51_PROPERTY_ENTRY_SIZE, "property-table")
+		expected_offset += entry["property_count"] * MDF2_51_PROPERTY_ENTRY_SIZE
+	string_start = expected_offset
+	for entry in entries:
+		if entry["first_material_name_offset"] != string_start:
+			raise MaterialProfileError("first-material-name-mismatch")
+	for material_index in range(material_count - 1):
+		entry = entries[material_index]
+		if entry["property_data_offset"] + entry["property_data_size"] != entries[material_index + 1]["property_data_offset"]:
+			raise MaterialProfileError("property-data-chain-mismatch")
+	last_entry = entries[-1]
+	if last_entry["property_data_offset"] + last_entry["property_data_size"] != len(data):
+		raise MaterialProfileError("property-data-tail-mismatch")
+	string_limit = entries[0]["property_data_offset"]
+	if string_limit < string_start:
+		raise MaterialProfileError("string-region-overlap")
+	materials = []
+	seen_names = {}
+	for entry in entries:
+		_materialCheckedRange(data, entry["property_data_offset"], entry["property_data_size"], "property-data")
+		material_name = _materialUtf16z(data, entry["name_offset"], string_limit, "material-name")
+		if material_name in seen_names:
+			raise MaterialProfileError("duplicate-material-name")
+		seen_names[material_name] = True
+		textures = []
+		for texture_index in range(entry["texture_count"]):
+			row_offset = entry["texture_table_offset"] + texture_index * MDF2_51_TEXTURE_ENTRY_SIZE
+			slot_offset, texture_hash, texture_path_offset, reserved = struct.unpack_from("<QQQQ", data, row_offset)
+			if reserved != 0:
+				raise MaterialProfileError("texture-reserved-mismatch")
+			slot = _materialUtf16z(data, slot_offset, string_limit, "texture-slot")
+			semantic, confidence, preview_use = PRAGMATA_TEXTURE_SEMANTICS.get(slot, ("raw", "unverified", "raw-only"))
+			textures.append({
+				"index": texture_index,
+				"slot": slot,
+				"path": _materialUtf16z(data, texture_path_offset, string_limit, "texture-path"),
+				"hash": texture_hash,
+				"semantic": semantic,
+				"confidence": confidence,
+				"preview_use": preview_use,
+			})
+		properties = []
+		for property_index in range(entry["property_count"]):
+			row_offset = entry["property_table_offset"] + property_index * MDF2_51_PROPERTY_ENTRY_SIZE
+			name_offset, name_hash, value_offset, value_count = struct.unpack_from("<QQII", data, row_offset)
+			value_size = value_count * 4
+			if value_count < 1 or value_offset + value_size > entry["property_data_size"]:
+				raise MaterialProfileError("property-value-out-of-bounds")
+			properties.append({
+				"index": property_index,
+				"name": _materialUtf16z(data, name_offset, string_limit, "property-name"),
+				"hash": name_hash,
+				"value_offset": value_offset,
+				"values": struct.unpack_from("<" + "f" * value_count, data, entry["property_data_offset"] + value_offset),
+			})
+		materials.append({
+			"index": entry["index"],
+			"name": material_name,
+			"hash": entry["hash"],
+			"shader_type": entry["shader_type"],
+			"alpha_flags_raw": entry["alpha_flags_raw"],
+			"master_material": _materialUtf16z(data, entry["master_material_offset"], string_limit, "master-material"),
+			"textures": textures,
+			"properties": properties,
+			"layout": entry,
+		})
+	result = {
+		"version": version,
+		"material_count": material_count,
+		"materials": materials,
+		"texture_count": sum([entry["texture_count"] for entry in entries]),
+		"property_count": sum([entry["property_count"] for entry in entries]),
+	}
+	if material_count == 1:
+		material = materials[0]
+		if len(material["textures"]) != MDF2_51_EXACT_TEXTURE_COUNT:
+			raise MaterialProfileError("texture-count-mismatch")
+		if len(material["properties"]) != MDF2_51_EXACT_PROPERTY_COUNT:
+			raise MaterialProfileError("property-count-mismatch")
+		legacy_textures = []
+		for texture in material["textures"]:
+			legacy_textures.append({
+				"index": texture["index"],
+				"slot": texture["slot"],
+				"path": texture["path"],
+				"hash": texture["hash"],
+			})
+		target_texture = None
+		for texture in legacy_textures:
+			if texture["slot"] == "DeadFilament_MaskMap":
+				if target_texture is not None:
+					raise MaterialProfileError("target-texture-duplicate")
+				target_texture = texture
+		if target_texture is None:
+			raise MaterialProfileError("target-texture-missing")
+		result.update({
+			"material_name": material["name"],
+			"material_hash": material["hash"],
+			"shader_type": material["shader_type"],
+			"alpha_flags_raw": material["alpha_flags_raw"],
+			"master_material": material["master_material"],
+			"textures": legacy_textures,
+			"target_texture": target_texture,
+			"properties": material["properties"],
+		})
+	return result
+
+def bindPragmataMaterialRecords(meshNames, materials):
+	materialsByName = {}
+	for material in materials:
+		name = material.get("name")
+		if name in materialsByName:
+			raise MaterialProfileError("duplicate-material-name")
+		materialsByName[name] = material
+	ordered = []
+	usedNames = {}
+	for name in meshNames:
+		if name not in materialsByName:
+			raise MaterialProfileError("mesh-material-missing:" + str(name))
+		ordered.append(materialsByName[name])
+		usedNames[name] = True
+	for material in materials:
+		if material["name"] not in usedNames:
+			raise MaterialProfileError("unused-mdf-material:" + material["name"])
+	return ordered
+
+
 def bind(runtime):
-	def _materialCheckedRange(data, start, size, label):
-		def materialRangeError(token):
-			prefix = "offset-out-of-bounds:"
-			if token.startswith(prefix):
-				token = token[len(prefix):] + "-out-of-bounds"
-			return MaterialProfileError(token)
-		return re_common.checked_range(data, start, size, label, materialRangeError)
-
-	def _materialScalar(data, offset, fmt, label):
-		_materialCheckedRange(data, offset, struct.calcsize(fmt), label)
-		return re_common.read_scalar(data, offset, fmt, label, MaterialProfileError)
-
-	def _materialUtf16z(data, offset, limit, label):
-		return re_common.read_utf16z(
-			data, offset, limit, label, MaterialProfileError)
-
-	def parsePragmataMdf2Profile(data, path):
-		if not path.lower().endswith(formats["PRAGMATA"]["mdfExt"]):
-			raise MaterialProfileError("mdf2-suffix-mismatch")
-		_materialCheckedRange(data, 0, 0x10, "mdf2-header")
-		if data[0:4] != b"MDF\0":
-			raise MaterialProfileError("mdf2-magic-mismatch")
-		version = _materialScalar(data, 4, "<H", "mdf2-version")
-		material_count = _materialScalar(data, 6, "<H", "material-count")
-		if version != 1:
-			raise MaterialProfileError("mdf2-version-mismatch")
-		if material_count < 1:
-			raise MaterialProfileError("material-count-mismatch")
-		entries_end = 0x10 + material_count * MDF2_51_ENTRY_SIZE
-		_materialCheckedRange(data, 0x10, material_count * MDF2_51_ENTRY_SIZE, "material-entries")
-		entries = []
-		for material_index in range(material_count):
-			entry_offset = 0x10 + material_index * MDF2_51_ENTRY_SIZE
-			entries.append({
-				"index": material_index,
-				"name_offset": _materialScalar(data, entry_offset, "<Q", "material-name"),
-				"hash": _materialScalar(data, entry_offset + 0x08, "<I", "material-hash"),
-				"property_data_size": _materialScalar(data, entry_offset + 0x0C, "<I", "property-data-size"),
-				"property_count": _materialScalar(data, entry_offset + 0x10, "<I", "property-count"),
-				"texture_count": _materialScalar(data, entry_offset + 0x14, "<I", "texture-count"),
-				"shader_type": _materialScalar(data, entry_offset + 0x20, "<I", "shader-type"),
-				"alpha_flags_raw": _materialScalar(data, entry_offset + 0x28, "<I", "alpha-flags"),
-				"property_table_offset": _materialScalar(data, entry_offset + 0x3C, "<Q", "property-table"),
-				"texture_table_offset": _materialScalar(data, entry_offset + 0x44, "<Q", "texture-table"),
-				"first_material_name_offset": _materialScalar(data, entry_offset + 0x4C, "<Q", "first-material-name"),
-				"property_data_offset": _materialScalar(data, entry_offset + 0x54, "<Q", "property-data"),
-				"master_material_offset": _materialScalar(data, entry_offset + 0x5C, "<Q", "master-material"),
-				"trailing_raw": _materialScalar(data, entry_offset + 0x64, "<Q", "material-trailing"),
-			})
-		if material_count > 1 and entries[0]["texture_table_offset"] == 0x7C:
-			raise MaterialProfileError("material-count-mismatch")
-		if material_count == 1:
-			if entries[0]["texture_count"] != MDF2_51_EXACT_TEXTURE_COUNT:
-				raise MaterialProfileError("texture-count-mismatch")
-			if entries[0]["property_count"] != MDF2_51_EXACT_PROPERTY_COUNT:
-				raise MaterialProfileError("property-count-mismatch")
-			_materialCheckedRange(data, entries[0]["texture_table_offset"], entries[0]["texture_count"] * MDF2_51_TEXTURE_ENTRY_SIZE, "texture-table")
-		expected_offset = entries_end
-		for entry in entries:
-			if entry["texture_table_offset"] != expected_offset:
-				raise MaterialProfileError("texture-table-chain-mismatch")
-			_materialCheckedRange(data, expected_offset, entry["texture_count"] * MDF2_51_TEXTURE_ENTRY_SIZE, "texture-table")
-			expected_offset += entry["texture_count"] * MDF2_51_TEXTURE_ENTRY_SIZE
-		for entry in entries:
-			if entry["property_table_offset"] != expected_offset:
-				raise MaterialProfileError("property-table-chain-mismatch")
-			_materialCheckedRange(data, expected_offset, entry["property_count"] * MDF2_51_PROPERTY_ENTRY_SIZE, "property-table")
-			expected_offset += entry["property_count"] * MDF2_51_PROPERTY_ENTRY_SIZE
-		string_start = expected_offset
-		for entry in entries:
-			if entry["first_material_name_offset"] != string_start:
-				raise MaterialProfileError("first-material-name-mismatch")
-		for material_index in range(material_count - 1):
-			entry = entries[material_index]
-			if entry["property_data_offset"] + entry["property_data_size"] != entries[material_index + 1]["property_data_offset"]:
-				raise MaterialProfileError("property-data-chain-mismatch")
-		last_entry = entries[-1]
-		if last_entry["property_data_offset"] + last_entry["property_data_size"] != len(data):
-			raise MaterialProfileError("property-data-tail-mismatch")
-		string_limit = entries[0]["property_data_offset"]
-		if string_limit < string_start:
-			raise MaterialProfileError("string-region-overlap")
-		materials = []
-		seen_names = {}
-		for entry in entries:
-			_materialCheckedRange(data, entry["property_data_offset"], entry["property_data_size"], "property-data")
-			material_name = _materialUtf16z(data, entry["name_offset"], string_limit, "material-name")
-			if material_name in seen_names:
-				raise MaterialProfileError("duplicate-material-name")
-			seen_names[material_name] = True
-			textures = []
-			for texture_index in range(entry["texture_count"]):
-				row_offset = entry["texture_table_offset"] + texture_index * MDF2_51_TEXTURE_ENTRY_SIZE
-				slot_offset, texture_hash, texture_path_offset, reserved = struct.unpack_from("<QQQQ", data, row_offset)
-				if reserved != 0:
-					raise MaterialProfileError("texture-reserved-mismatch")
-				slot = _materialUtf16z(data, slot_offset, string_limit, "texture-slot")
-				semantic, confidence, preview_use = PRAGMATA_TEXTURE_SEMANTICS.get(slot, ("raw", "unverified", "raw-only"))
-				textures.append({
-					"index": texture_index,
-					"slot": slot,
-					"path": _materialUtf16z(data, texture_path_offset, string_limit, "texture-path"),
-					"hash": texture_hash,
-					"semantic": semantic,
-					"confidence": confidence,
-					"preview_use": preview_use,
-				})
-			properties = []
-			for property_index in range(entry["property_count"]):
-				row_offset = entry["property_table_offset"] + property_index * MDF2_51_PROPERTY_ENTRY_SIZE
-				name_offset, name_hash, value_offset, value_count = struct.unpack_from("<QQII", data, row_offset)
-				value_size = value_count * 4
-				if value_count < 1 or value_offset + value_size > entry["property_data_size"]:
-					raise MaterialProfileError("property-value-out-of-bounds")
-				properties.append({
-					"index": property_index,
-					"name": _materialUtf16z(data, name_offset, string_limit, "property-name"),
-					"hash": name_hash,
-					"value_offset": value_offset,
-					"values": struct.unpack_from("<" + "f" * value_count, data, entry["property_data_offset"] + value_offset),
-				})
-			materials.append({
-				"index": entry["index"],
-				"name": material_name,
-				"hash": entry["hash"],
-				"shader_type": entry["shader_type"],
-				"alpha_flags_raw": entry["alpha_flags_raw"],
-				"master_material": _materialUtf16z(data, entry["master_material_offset"], string_limit, "master-material"),
-				"textures": textures,
-				"properties": properties,
-				"layout": entry,
-			})
-		result = {
-			"version": version,
-			"material_count": material_count,
-			"materials": materials,
-			"texture_count": sum([entry["texture_count"] for entry in entries]),
-			"property_count": sum([entry["property_count"] for entry in entries]),
-		}
-		if material_count == 1:
-			material = materials[0]
-			if len(material["textures"]) != MDF2_51_EXACT_TEXTURE_COUNT:
-				raise MaterialProfileError("texture-count-mismatch")
-			if len(material["properties"]) != MDF2_51_EXACT_PROPERTY_COUNT:
-				raise MaterialProfileError("property-count-mismatch")
-			legacy_textures = []
-			for texture in material["textures"]:
-				legacy_textures.append({
-					"index": texture["index"],
-					"slot": texture["slot"],
-					"path": texture["path"],
-					"hash": texture["hash"],
-				})
-			target_texture = None
-			for texture in legacy_textures:
-				if texture["slot"] == "DeadFilament_MaskMap":
-					if target_texture is not None:
-						raise MaterialProfileError("target-texture-duplicate")
-					target_texture = texture
-			if target_texture is None:
-				raise MaterialProfileError("target-texture-missing")
-			result.update({
-				"material_name": material["name"],
-				"material_hash": material["hash"],
-				"shader_type": material["shader_type"],
-				"alpha_flags_raw": material["alpha_flags_raw"],
-				"master_material": material["master_material"],
-				"textures": legacy_textures,
-				"target_texture": target_texture,
-				"properties": material["properties"],
-			})
-		return result
-
-	def bindPragmataMaterialRecords(meshNames, materials):
-		materialsByName = {}
-		for material in materials:
-			name = material.get("name")
-			if name in materialsByName:
-				raise MaterialProfileError("duplicate-material-name")
-			materialsByName[name] = material
-		ordered = []
-		usedNames = {}
-		for name in meshNames:
-			if name not in materialsByName:
-				raise MaterialProfileError("mesh-material-missing:" + str(name))
-			ordered.append(materialsByName[name])
-			usedNames[name] = True
-		for material in materials:
-			if material["name"] not in usedNames:
-				raise MaterialProfileError("unused-mdf-material:" + material["name"])
-		return ordered
-
 	def buildNoesisMaterial(record, textureNamesBySlot):
 		material = _new_material(runtime.NoeMaterial, record["name"])
 		for prop in record.get("properties", []):
@@ -309,6 +310,87 @@ MESH_RUNTIME_DEPENDENCIES = (
 	'texLoadDDS',
 	'texOutputExt',
 )
+
+
+def readLegacyMaterialEntry(bs, version, i, read_string):
+	if version > 3:
+		bs.seek(0x10 + (i * 100))
+	elif version > 2:
+		bs.seek(0x10 + (i * 80))
+	else:
+		bs.seek(0x10 + (i * 64))
+
+	materialNamesOffset = bs.readUInt64()
+	materialHash = bs.readInt()
+	sizeOfFloatStr = bs.readUInt()
+	floatCount = bs.readUInt()
+	texCount = bs.readUInt()
+
+	if version >= 3:
+		bs.seek(8,1)
+
+	shaderType = bs.readUInt()
+	if version >= 4:
+		uknSF6int = bs.readUInt()
+
+	alphaFlag = bs.readUInt()
+
+	if version >= 4:
+		uknSF6int2 = bs.readUInt()
+		uknSF6int3 = bs.readUInt()
+
+	floatHdrOffs = bs.readUInt64()
+	texHdrOffs = bs.readUInt64()
+	if version >= 3:
+		firstMtrlNameOffs = bs.readUInt64()
+	floatStartOffs = bs.readUInt64()
+	mmtr_PathOffs = bs.readUInt64()
+
+	if version >= 4:
+		uknSF6offset = bs.readUInt64()
+
+	bs.seek(materialNamesOffset)
+	materialName = read_string(bs)
+	bs.seek(mmtr_PathOffs)
+	mmtrName = read_string(bs).lower()
+	return {
+		"index": i, "name": materialName, "hash": materialHash,
+		"shader_type": shaderType, "alpha_flags_raw": alphaFlag,
+		"master_material": mmtrName, "property_count": floatCount,
+		"texture_count": texCount, "property_table_offset": floatHdrOffs,
+		"texture_table_offset": texHdrOffs, "property_data_offset": floatStartOffs,
+	}
+
+
+def readLegacyMaterialProperty(bs, version, entry, index, read_string):
+	bs.seek(entry["property_table_offset"] + index * 0x18)
+	row = [bs.readUInt64(), bs.readUInt64(), bs.readUInt(), bs.readUInt()]
+	bs.seek(row[0])
+	name = read_string(bs)
+	offset, count = (row[2], row[3]) if version >= 2 else (row[3], row[2])
+	bs.seek(entry["property_data_offset"] + offset)
+	values = None
+	if count == 4:
+		values = (bs.readFloat(), bs.readFloat(), bs.readFloat(), bs.readFloat())
+	elif count == 1:
+		values = (bs.readFloat(),)
+	return {"name": name, "hash": row[1], "values": values}
+
+
+def readLegacyMaterialTexture(bs, version, entry, index, read_string):
+	if version >= 2:
+		bs.seek(entry["texture_table_offset"] + index * 0x20)
+		row = [bs.readUInt64(), bs.readUInt64(), bs.readUInt64(), bs.readUInt64()]
+		if version >= 4:
+			bs.seek(8, 1)
+	else:
+		bs.seek(entry["texture_table_offset"] + index * 0x18)
+		row = [bs.readUInt64(), bs.readUInt64(), bs.readUInt64()]
+	bs.seek(row[0])
+	slot = read_string(bs)
+	bs.seek(row[2])
+	path = read_string(bs).replace("@", "")
+	return {"slot": slot, "path": path, "hash": row[1]}
 
 
 def bind_mesh_materials(runtime):
@@ -456,46 +538,12 @@ def bind_mesh_materials(runtime):
 		#Parse Materials
 		for i in range(matCountMDF):
 
-			if self.mdfVer > 3:
-				bs.seek(0x10 + (i * 100))
-			elif self.mdfVer > 2:
-				bs.seek(0x10 + (i * 80))
-			else:
-				bs.seek(0x10 + (i * 64))
-
-			materialNamesOffset = bs.readUInt64()
-			materialHash = bs.readInt()
-			sizeOfFloatStr = bs.readUInt()
-			floatCount = bs.readUInt()
-			texCount = bs.readUInt()
-
-			if self.mdfVer >= 3:
-				bs.seek(8,1)
-
-			shaderType = bs.readUInt()
-			if self.mdfVer >= 4:
-				uknSF6int = bs.readUInt()
-
-			alphaFlag = bs.readUInt()
-
-			if self.mdfVer >= 4:
-				uknSF6int2 = bs.readUInt()
-				uknSF6int3 = bs.readUInt()
-
-			floatHdrOffs = bs.readUInt64()
-			texHdrOffs = bs.readUInt64()
-			if self.mdfVer >= 3:
-				firstMtrlNameOffs = bs.readUInt64()
-			floatStartOffs = bs.readUInt64()
-			mmtr_PathOffs = bs.readUInt64()
-
-			if self.mdfVer >= 4:
-				uknSF6offset = bs.readUInt64()
-
-			bs.seek(materialNamesOffset)
-			materialName = runtime.ReadUnicodeString(bs)
-			bs.seek(mmtr_PathOffs)
-			mmtrName = runtime.ReadUnicodeString(bs).lower()
+			record = readLegacyMaterialEntry(bs, self.mdfVer, i, runtime.ReadUnicodeString)
+			materialName = record["name"]
+			materialHash = record["hash"]
+			mmtrName = record["master_material"]
+			floatCount = record["property_count"]
+			texCount = record["texture_count"]
 			#hasTransparency = not not (((alphaFlag & ( 1 << 1 )) >> 1) or ((alphaFlag & ( 1 << 4 )) >> 4))
 			hasTransparency = "_dirt" in mmtrName or "_decal" in mmtrName or "_hair" in mmtrName
 
@@ -515,8 +563,6 @@ def bind_mesh_materials(runtime):
 			#material.setBlendMode("GL_ONE", "GL_ONE")
 
 			#Parse Textures
-			textureInfo = []
-			paramInfo = []
 
 			bFoundBM = False
 			bFoundNM = False
@@ -533,24 +579,10 @@ def bind_mesh_materials(runtime):
 				print ("Material Properties:")
 
 			for j in range(floatCount): # floats
-				bs.seek(floatHdrOffs + (j * 0x18))
-				paramInfo.append([bs.readUInt64(), bs.readUInt64(), bs.readUInt(), bs.readUInt()]) #dscrptnOffs[0], type[1], strctOffs[2], numFloats[3]
-				bs.seek(paramInfo[j][0])
-				paramType = runtime.ReadUnicodeString(bs)
-
-				colours = None
-				if self.mdfVer >= 2: #sGameName == "RERT" or sGameName == "RE3" or sGameName == "ReVerse" or sGameName == "RE8" or sGameName == "MHRise" or sGameName == "SF6":
-					bs.seek(floatStartOffs + paramInfo[j][2])
-					if paramInfo[j][3] == 4:
-						colours = runtime.NoeVec4((bs.readFloat(), bs.readFloat(), bs.readFloat(), bs.readFloat()))
-					elif paramInfo[j][3] == 1:
-						colours = bs.readFloat()
-				else:
-					bs.seek(floatStartOffs + paramInfo[j][3])
-					if paramInfo[j][2] == 4:
-						colours = runtime.NoeVec4((bs.readFloat(), bs.readFloat(), bs.readFloat(), bs.readFloat()))
-					elif paramInfo[j][2] == 1:
-						colours = bs.readFloat()
+				propertyRecord = readLegacyMaterialProperty(bs, self.mdfVer, record, j, runtime.ReadUnicodeString)
+				paramType = propertyRecord["name"]
+				values = propertyRecord["values"]
+				colours = (runtime.NoeVec4(values) if len(values) == 4 else values[0]) if values is not None else None
 
 				if doPrintMDF:
 					print(paramType + ":", colours)
@@ -599,18 +631,9 @@ def bind_mesh_materials(runtime):
 
 			for j in range(texCount): # texture headers
 
-				if self.mdfVer >= 2:
-					bs.seek(texHdrOffs + (j * 0x20))
-					textureInfo.append([bs.readUInt64(), bs.readUInt64(), bs.readUInt64(), bs.readUInt64()]) #TextureTypeOffset[0], uknBytes[1], TexturePathOffset[2], padding[3]
-					if self.mdfVer >= 4:
-						bs.seek(8,1)
-				else:
-					bs.seek(texHdrOffs + (j * 0x18))
-					textureInfo.append([bs.readUInt64(), bs.readUInt64(), bs.readUInt64()])
-				bs.seek(textureInfo[j][0])
-				textureType = runtime.ReadUnicodeString(bs)
-				bs.seek(textureInfo[j][2])
-				textureName = runtime.ReadUnicodeString(bs).replace("@", "")
+				textureRecord = readLegacyMaterialTexture(bs, self.mdfVer, record, j, runtime.ReadUnicodeString)
+				textureType = textureRecord["slot"]
+				textureName = textureRecord["path"]
 
 				textureFilePath = ""
 				texName = ""
