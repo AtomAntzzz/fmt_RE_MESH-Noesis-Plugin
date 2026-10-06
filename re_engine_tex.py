@@ -4,7 +4,7 @@ import copy
 import os
 import re
 import struct
-from re_engine_materials import _materialCheckedRange, _materialScalar
+from re_engine_types import _materialCheckedRange, _materialScalar
 from re_engine_config import (
 	texFormatLayouts,
 	extToFormat,
@@ -17,23 +17,9 @@ from re_engine_types import (
 )
 
 # Host/state/callback dependencies (resolved on use, never copied).
-RUNTIME_DEPENDENCIES = (
-	'NoeBitStream',
-	'NoeTexture',
-	'bImportMips',
-	'convertTexVersion',
-	'decodePragmataTexMips',
-	'findSourceTexFile',
-	'loadGDeflateDecoder',
-	'noesis',
-	'parsePragmataTexProfile',
-	'preparePragmataTexSurface',
-	'rapi',
-	'readTextureData',
-	'readUByteAt',
-	'readUIntAt',
-	'texFile',
-)
+RUNTIME_DEPENDENCIES = ('NoeBitStream', 'NoeTexture', 'convertTexVersion', 'findSourceTexFile', 'noesis', 'rapi', 'readUByteAt', 'readUIntAt', 'texFile')
+
+TEXTURE_IMPORT_RUNTIME_DEPENDENCIES = ('NoeBitStream', 'NoeTexture', 'bImportMips', 'convertTexVersion', 'decodePragmataTexMips', 'loadGDeflateDecoder', 'noesis', 'parsePragmataTexProfile', 'preparePragmataTexSurface', 'rapi', 'readTextureData')
 
 
 def parsePragmataTexProfile(data, path):
@@ -179,6 +165,121 @@ def appendTextureSurface(texture_type, pixel_type, textures, surface):
 	return texture
 
 
+def loadTextureForImport(runtime, data, textures, texture_name, source_path, texture_profile=None, decoder=None):
+	texture_name = texture_name or runtime.rapi.getInputName()
+	modern_data = len(data) >= 8 and struct.unpack_from("<I", data, 4)[0] == formats["PRAGMATA"]["texVersion"]
+	family = texture_profile["family"] if texture_profile is not None else ("tex-251111100" if modern_data else "legacy")
+	if family not in ("legacy", "tex-251111100"):
+		raise MaterialProfileError("unsupported-texture-import-family")
+	# A known on-disk identity retains its validation even through a legacy caller.
+	if modern_data or family == "tex-251111100":
+		try:
+			profilePath = source_path or runtime.rapi.getInputName()
+			profile = runtime.parsePragmataTexProfile(data, profilePath)
+			decoder = decoder or runtime.loadGDeflateDecoder()
+			decodedMips = runtime.decodePragmataTexMips(data, profile, decoder)
+			tex = False
+			for index, mipData in enumerate(decodedMips):
+				mip = profile["mips"][index]
+				if not runtime.bImportMips and mip["mip_index"] != 0:
+					continue
+				surfaceData = runtime.preparePragmataTexSurface(mipData, mip)
+				texData, fmtName = runtime.readTextureData(surfaceData, mip["width"], mip["height"], profile["format"])
+				if texData == 0:
+					return 0
+				imageName = texture_name
+				if profile["image_count"] > 1:
+					nameRoot, nameExt = os.path.splitext(texture_name)
+					imageLabel = "face" if profile["cubemap"] else "image"
+					imageName = nameRoot + "_" + imageLabel + "_" + str(mip["image_index"]) + nameExt
+				if runtime.bImportMips and profile["mip_count"] > 1:
+					nameRoot, nameExt = os.path.splitext(imageName)
+					imageName = nameRoot + "_mip_" + str(mip["mip_index"]) + nameExt
+				tex = appendTextureSurface(runtime.NoeTexture, runtime.noesis.NOESISTEX_RGBA32,
+					textures, (imageName, mip["width"], mip["height"], texData))
+			fmtName = texFormatNames.get(profile["format"], str(profile["format"]))
+			print("PRAGMATA TEX profile:", profile["width"], "x", profile["height"], "x", profile["depth"], fmtName + ",", profile["image_count"], "images,", profile["mip_count"], "mips")
+			return tex
+		except MaterialProfileError as error:
+			print("PRAGMATA TEX exact profile rejected:", str(error))
+			return 0
+	bs = runtime.NoeBitStream(data)
+	magic = bs.readUInt()
+	version = bs.readUInt()
+	width = bs.readUShort()
+	height = bs.readUShort()
+	unk00 = bs.readUShort()
+	version = runtime.convertTexVersion(version)
+
+	if version > 27:
+		numImages = bs.readUByte()
+		oneImgMipHdrSize = bs.readUByte()
+		mipCount = int(oneImgMipHdrSize / 16)
+	else:
+		mipCount = bs.readUByte()
+		numImages = bs.readUByte()
+
+	format = bs.readUInt()
+	unk02 = bs.readUInt()
+	unk03 = bs.readUInt()
+	unk04 = bs.readUInt()
+
+	if version > 27:
+		bs.seek(8,1)
+
+	mipData = []
+	for i in range(numImages):
+		mipDataImg = []
+		for j in range(mipCount):
+			mipDataImg.append([bs.readUInt64(), bs.readUInt(), bs.readUInt()]) #[0]offset, [1]pitch, [2]size
+		mipData.append(mipDataImg)
+		#bs.seek((mipCount-1)*16, 1) #skip small mipmaps
+
+	formatName = texFormatNames[format]
+	bpp = fmtNameToBpp[formatName]
+	width = int((mipDataImg[0][1] / bpp) * 2)
+	print(formatName, bpp)
+
+	texFormat = runtime.noesis.NOESISTEX_RGBA32
+	tex = False
+
+	for i in range(numImages):
+		mipWidth = width
+		mipHeight = height
+
+		for j in range(mipCount):
+			try:
+				bs.seek(mipData[i][j][0])
+				texData = bs.readBytes(mipData[i][j][2])
+			except:
+				if i > 0:
+					numImages = i - 1
+					print ("Multi-image load stopped early")
+					break
+				else:
+					return 0
+			try:
+				texData, fmtName = runtime.readTextureData(texData, mipWidth, mipHeight, format)
+			except:
+				print("Failed", mipWidth, mipHeight, format, texData)
+				texData, fmtName = runtime.readTextureData(texData, mipWidth, mipHeight, format)
+			if texData == 0:
+				return 0
+
+			tex = appendTextureSurface(runtime.NoeTexture, texFormat,
+				textures, (texture_name, int(mipWidth), int(mipHeight), texData))
+
+			if not runtime.bImportMips:
+				break
+			if mipWidth > 4:
+				mipWidth = int(mipWidth / 2)
+			if mipHeight > 4:
+				mipHeight = int(mipHeight / 2)
+
+	return tex
+
+
+
 def bind(runtime):
 	def texCheckType(data):
 		bs = runtime.NoeBitStream(data)
@@ -253,112 +354,7 @@ def bind(runtime):
 		return runtime.NoeTexture(name, 4, 4, imageData, runtime.noesis.NOESISTEX_RGBA32)
 
 	def texLoadDDS(data, texList, texName="", sourcePath=None, pragmataDecoder=None):
-		texName = texName or runtime.rapi.getInputName()
-		if len(data) >= 8 and struct.unpack_from("<I", data, 4)[0] == formats["PRAGMATA"]["texVersion"]:
-			try:
-				profilePath = sourcePath or runtime.rapi.getInputName()
-				profile = runtime.parsePragmataTexProfile(data, profilePath)
-				decoder = pragmataDecoder or runtime.loadGDeflateDecoder()
-				decodedMips = runtime.decodePragmataTexMips(data, profile, decoder)
-				tex = False
-				for index, mipData in enumerate(decodedMips):
-					mip = profile["mips"][index]
-					if not runtime.bImportMips and mip["mip_index"] != 0:
-						continue
-					surfaceData = runtime.preparePragmataTexSurface(mipData, mip)
-					texData, fmtName = runtime.readTextureData(surfaceData, mip["width"], mip["height"], profile["format"])
-					if texData == 0:
-						return 0
-					imageName = texName
-					if profile["image_count"] > 1:
-						nameRoot, nameExt = os.path.splitext(texName)
-						imageLabel = "face" if profile["cubemap"] else "image"
-						imageName = nameRoot + "_" + imageLabel + "_" + str(mip["image_index"]) + nameExt
-					if runtime.bImportMips and profile["mip_count"] > 1:
-						nameRoot, nameExt = os.path.splitext(imageName)
-						imageName = nameRoot + "_mip_" + str(mip["mip_index"]) + nameExt
-					tex = appendTextureSurface(runtime.NoeTexture, runtime.noesis.NOESISTEX_RGBA32,
-						texList, (imageName, mip["width"], mip["height"], texData))
-				fmtName = texFormatNames.get(profile["format"], str(profile["format"]))
-				print("PRAGMATA TEX profile:", profile["width"], "x", profile["height"], "x", profile["depth"], fmtName + ",", profile["image_count"], "images,", profile["mip_count"], "mips")
-				return tex
-			except MaterialProfileError as error:
-				print("PRAGMATA TEX exact profile rejected:", str(error))
-				return 0
-		bs = runtime.NoeBitStream(data)
-		magic = bs.readUInt()
-		version = bs.readUInt()
-		width = bs.readUShort()
-		height = bs.readUShort()
-		unk00 = bs.readUShort()
-		version = runtime.convertTexVersion(version)
-		
-		if version > 27:
-			numImages = bs.readUByte()
-			oneImgMipHdrSize = bs.readUByte()
-			mipCount = int(oneImgMipHdrSize / 16)
-		else:
-			mipCount = bs.readUByte()
-			numImages = bs.readUByte()
-		
-		format = bs.readUInt()
-		unk02 = bs.readUInt()
-		unk03 = bs.readUInt()
-		unk04 = bs.readUInt()
-		
-		if version > 27:
-			bs.seek(8,1)
-		
-		mipData = []
-		for i in range(numImages):
-			mipDataImg = []
-			for j in range(mipCount):
-				mipDataImg.append([bs.readUInt64(), bs.readUInt(), bs.readUInt()]) #[0]offset, [1]pitch, [2]size
-			mipData.append(mipDataImg)
-			#bs.seek((mipCount-1)*16, 1) #skip small mipmaps
-		
-		formatName = texFormatNames[format]
-		bpp = fmtNameToBpp[formatName]
-		width = int((mipDataImg[0][1] / bpp) * 2)
-		print(formatName, bpp)
-		
-		texFormat = runtime.noesis.NOESISTEX_RGBA32
-		tex = False
-		
-		for i in range(numImages):
-			mipWidth = width
-			mipHeight = height
-			
-			for j in range(mipCount):
-				try:
-					bs.seek(mipData[i][j][0])
-					texData = bs.readBytes(mipData[i][j][2])
-				except:
-					if i > 0:
-						numImages = i - 1
-						print ("Multi-image load stopped early")
-						break
-					else:
-						return 0
-				try:
-					texData, fmtName = runtime.readTextureData(texData, mipWidth, mipHeight, format)
-				except:
-					print("Failed", mipWidth, mipHeight, format, texData)
-					texData, fmtName = runtime.readTextureData(texData, mipWidth, mipHeight, format)
-				if texData == 0:
-					return 0
-				
-				tex = appendTextureSurface(runtime.NoeTexture, texFormat,
-					texList, (texName, int(mipWidth), int(mipHeight), texData))
-				
-				if not runtime.bImportMips:
-					break
-				if mipWidth > 4: 
-					mipWidth = int(mipWidth / 2)
-				if mipHeight > 4: 
-					mipHeight = int(mipHeight / 2)
-					
-		return tex
+		return loadTextureForImport(runtime, data, texList, texName, sourcePath, decoder=pragmataDecoder)
 
 	def getNoesisDDSType(imgType):
 		ddsFmt = runtime.noesis.NOE_ENCODEDXT_BC7

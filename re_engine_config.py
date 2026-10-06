@@ -1,5 +1,6 @@
 """Single source of game and observed format configuration."""
 
+from copy import deepcopy
 from re_engine_types import MeshCapability
 
 texFormatLayouts = {
@@ -120,6 +121,51 @@ formats = {
 	"DRDR": 		{ "modelExt": ".240424828",  "texExt": ".240606151", "mmtrExt": ".240405143",  "nDir": "stm", "mdfExt": ".mdf2.40", "meshVersion": 3, "mdfVersion": 4, "mlistExt": ".854", "meshMagic":240423829, "motionIDsData":[72,8] },
 	"PRAGMATA": 	{ "texVersion": 251111100, "modelExt": ".251121828",  "texExt": ".251111100",   "mmtrExt": "",            "nDir": "stm", "mdfExt": ".mdf2.51", "meshVersion": 3, "mdfVersion": 5, "mlistExt": "",     "meshMagic":250707828, "motionIDsData":[72,8] },
 }
+
+# These are existing import semantics, not declarations of new format support.
+# Keep them on the metadata records so copied descriptions remain self-contained.
+for _record in formats.values():
+	_record["import"] = {
+		"mesh": {"family": "legacy", "construction": "legacy-sort-fallback",
+			"names_offset": 120 if _record["meshVersion"] < 3 else 144,
+			"vertex_header_extra": False, "bone_capacity": 256,
+			"bone_codec": "u8", "submesh": "legacy"},
+		"material": {"family": "legacy", "sibling_directory": None,
+			"stm_retry": False, "atlas_uv": False},
+		"texture": {"family": "legacy"},
+		"motion": {"family": "legacy", "file_suffix": ".motlist" + _record["mlistExt"]},
+	}
+for _name in ("AJ_AAT", "DD2", "DRDR"):
+	formats[_name]["import"]["mesh"]["names_offset"] = 136
+for _name in ("RERT", "RE7RT", "MHRSunbreak"):
+	formats[_name]["import"]["mesh"]["vertex_header_extra"] = True
+formats["SF6"]["import"]["mesh"].update(bone_capacity=1024, bone_codec="six-u10")
+formats["DRDR"]["import"]["mesh"]["submesh"] = "drdr"
+formats["ReVerse"]["import"]["material"]["sibling_directory"] = "Material"
+for _name in ("MHRise", "MHRSunbreak"):
+	formats[_name]["import"]["material"]["stm_retry"] = True
+formats["RE7RT"]["import"]["material"]["atlas_uv"] = True
+formats["PRAGMATA"]["import"]["mesh"].update(
+	family="mesh-250707828", construction="ordinary-sort-strict")
+formats["PRAGMATA"]["import"]["material"]["family"] = "mdf-51-observed"
+formats["PRAGMATA"]["import"]["texture"]["family"] = "tex-251111100"
+formats["PRAGMATA"]["import"]["motion"].update(
+	family="motlist-1057-mot-993", file_suffix=".motlist.1057")
+del _record, _name
+
+
+def composeImportProfile(game_name, format_record, mesh_capability=None):
+	"""Copy a description for one import; callers still validate its payload."""
+	metadata = deepcopy(format_record)
+	profile = metadata.pop("import")
+	profile["game_name"] = game_name
+	profile["format"] = metadata
+	if mesh_capability == PRAGMATA_MPLY_250707828:
+		profile["mesh"].update(family="mply-250707828", construction="mply-unsorted-strict")
+	elif mesh_capability == PRAGMATA_250707828:
+		profile["mesh"].update(family="mesh-250707828", construction="ordinary-sort-strict")
+	return profile
+
 
 extToFormat = { #incomplete, just testing
 	"10": {

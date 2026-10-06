@@ -2,7 +2,8 @@
 
 import os
 import time
-from re_engine_animation import LegacyMotlistSelectionSource
+from re_engine_runtime import currentImportSession, ImportSelectionDraft
+from re_engine_animation import LegacyMotlistSelectionSource, CachedMotlistSelectionSource
 from re_engine_config import (
 	formats,
 	fullGameNames,
@@ -35,6 +36,30 @@ RUNTIME_DEPENDENCIES = (
 def bind(runtime):
 	legacySelectionSource = LegacyMotlistSelectionSource(runtime)
 	class DialogOptions:
+		@property
+		def currentDir(self):
+			return currentImportSession(runtime).selection.currentDir
+
+		@currentDir.setter
+		def currentDir(self, value):
+			currentImportSession(runtime).selection.currentDir = value
+
+		@property
+		def dialog(self):
+			return currentImportSession(runtime).selection.dialog
+
+		@dialog.setter
+		def dialog(self, value):
+			currentImportSession(runtime).selection.dialog = value
+
+		@property
+		def motDialog(self):
+			return currentImportSession(runtime).selection.motDialog
+
+		@motDialog.setter
+		def motDialog(self, value):
+			currentImportSession(runtime).selection.motDialog = value
+
 		def __init__(self):
 			self.doLoadTex = False
 			self.doConvertTex = True
@@ -56,7 +81,34 @@ def bind(runtime):
 
 	runtime.dialogOptions = DialogOptions()
 
+	def selectionField(name):
+		# Only the five declared queue/cache fields use this compatibility view.
+		def draft(window):
+			if not hasattr(window, "_selectionDraft"):
+				window._selectionDraft = ImportSelectionDraft()
+				currentImportSession(runtime).selection.drafts.append(window._selectionDraft)
+			return window._selectionDraft
+		def get(window):
+			return getattr(draft(window), name)
+		def set(window, value):
+			setattr(draft(window), name, value)
+		return property(get, set)
+
 	class openOptionsDialogImportWindow:
+		loadItems = selectionField("loadItems")
+		fullLoadItems = selectionField("fullLoadItems")
+		loadedMlists = selectionField("loadedMlists")
+		selectionSources = selectionField("selectionSources")
+		selectedActions = selectionField("selectedActions")
+
+		@property
+		def sourceOperations(self):
+			source = getattr(self, "selectionSource", None)
+			if source is None:
+				return legacySelectionSource
+			if hasattr(source, "loadFile"):
+				return source
+			return CachedMotlistSelectionSource(runtime, source)
 
 		def __init__(self, width=runtime.dialogOptions.width, height=runtime.dialogOptions.height, args={}):
 			# Shared state is owned by runtime.
@@ -65,7 +117,7 @@ def bind(runtime):
 			self.height = height
 			self.args = args
 			self.selectionSource = args.get("selectionSource")
-			self.selectionOnly = self.selectionSource is not None
+			self.selectionOnly = self.selectionSource is not None and getattr(self.selectionSource, "selectionOnly", True)
 			if self.selectionOnly:
 				runtime.sGameName = self.selectionSource.gameName
 			self.pak = args.get("motlist") or args.get("mesh")
@@ -136,38 +188,11 @@ def bind(runtime):
 				#dialogOptions.motDialog.createMotlistWindow()
 
 		def clickLoadButton(self):
-			if self.selectionOnly:
-				selected_actions = self._resolveSelectionItems()
-				if not selected_actions:
-					return
-				self.selectedActions = selected_actions
-				self.isOpen = False
+			if self.sourceOperations.acceptSelection(self):
 				self.noeWnd.closeWindow()
-				return
-			self.isOpen = False
-			if self.isMotlist:
-				self.loadedMlists = {}
-				legacySelectionSource.prepareSelection(
-					self.pak, self.loadItems, self.fullLoadItems, self.loadedMlists)
-			self.noeWnd.closeWindow()
 
 		def _resolveSelectionItems(self):
-			if len(self.loadItems) != len(self.fullLoadItems):
-				raise MeshProfileError(
-					"structural-profile-mismatch:animation-selection")
-			selections = []
-			seen = set()
-			for item, path in zip(self.loadItems, self.fullLoadItems):
-				source = self.selectionSources.get(path)
-				if source is None:
-					raise MeshProfileError(
-						"structural-profile-mismatch:animation-selection")
-				for slot_index in source.slots_for_items([item]):
-					identity = (path, slot_index)
-					if identity not in seen:
-						seen.add(identity)
-						selections.append(source.selection_for_slot(slot_index))
-			return selections
+			return self.sourceOperations.resolveSelection(self)
 
 		def openOptionsButtonLoadEntry(self, noeWnd, controlId, wParam, lParam):
 			self.clickLoadButton()
@@ -211,10 +236,7 @@ def bind(runtime):
 			self.motIdx = self.motLoadList.getSelectionIndex()
 			if self.clicker.name == "motList" and self.motIdx == self.clicker.idx and time.time() - self.clicker.timer < 0.25:
 				addedName = self.motLoadList.getStringForIndex(self.motIdx)
-				is_new_item = addedName not in self.loadItems
-				if self.selectionOnly:
-					is_new_item = (addedName, self.pak.path) not in zip(
-						self.loadItems, self.fullLoadItems)
+				is_new_item = self.sourceOperations.isNewItem(self, addedName)
 				if is_new_item:
 					self.loadItems.append(addedName)
 					self.fullLoadItems.append(self.pak.path)
@@ -222,11 +244,7 @@ def bind(runtime):
 			self.clicker = DoubleClickTimer(name="motList", idx=self.motIdx, timer=time.time())
 
 		def _loadSelectionPak(self, path):
-			if not self.selectionOnly:
-				return legacySelectionSource.load(path)
-			if path not in self.selectionSources:
-				self.selectionSources[path] = self.selectionSource.load(path)
-			return self.selectionSources[path]
+			return self.sourceOperations.loadFile(path, self.selectionSources)
 
 		def selectPakListItem(self, noeWnd, controlId, wParam, lParam):
 			self.pakIdx = self.pakList.getSelectionIndex()
@@ -475,18 +493,18 @@ def bind(runtime):
 				if True:
 					index = self.noeWnd.createCheckBox("Force Center", 10, 640, 100, 30, self.checkFCenterCheckbox)
 					self.FCenterCheckbox = self.noeWnd.getControlByIndex(index)
-					self.FCenterCheckbox.setChecked(not self.selectionOnly and runtime.dialogOptions.doForceCenter)
-					self.noeWnd.enableControlByIndex(index, not self.selectionOnly)
+					self.FCenterCheckbox.setChecked(self.sourceOperations.optionEnabled("force_center") and runtime.dialogOptions.doForceCenter)
+					self.noeWnd.enableControlByIndex(index, self.sourceOperations.optionEnabled("force_center"))
 
 					index = self.noeWnd.createCheckBox("Sync by Frame Count", 10, 670, 160, 30, self.checkSyncCheckbox)
 					self.syncCheckbox = self.noeWnd.getControlByIndex(index)
-					self.syncCheckbox.setChecked(not self.selectionOnly and runtime.dialogOptions.doSync)
-					self.noeWnd.enableControlByIndex(index, not self.selectionOnly)
+					self.syncCheckbox.setChecked(self.sourceOperations.optionEnabled("sync") and runtime.dialogOptions.doSync)
+					self.noeWnd.enableControlByIndex(index, self.sourceOperations.optionEnabled("sync"))
 
 					index = self.noeWnd.createCheckBox("Force Merge All", 10, 700, 160, 30, self.checkForceMergeCheckbox)
 					self.forceMergeCheckbox = self.noeWnd.getControlByIndex(index)
-					self.forceMergeCheckbox.setChecked(not self.selectionOnly and runtime.dialogOptions.doForceMergeAnims)
-					self.noeWnd.enableControlByIndex(index, not self.selectionOnly)
+					self.forceMergeCheckbox.setChecked(self.sourceOperations.optionEnabled("force_merge") and runtime.dialogOptions.doForceMergeAnims)
+					self.noeWnd.enableControlByIndex(index, self.sourceOperations.optionEnabled("force_merge"))
 
 				self.noeWnd.createStatic("Game:", width-218, 645, 60, 20)
 				index = self.noeWnd.createComboBox(width-170, 645, 150, 20, self.selectGameBoxItem, runtime.noewin.CBS_DROPDOWNLIST) #CB

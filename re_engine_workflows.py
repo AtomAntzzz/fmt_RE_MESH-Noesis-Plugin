@@ -1,12 +1,12 @@
 """Workflows implementation bound to one plugin runtime."""
 
 import json
-import re_engine_common as re_common
+from re_engine_animation import loadMotionImport, attachSelectedAnimations, makeAnimationSelectionSource
+from re_engine_runtime import beginImportSession
 from re_engine_config import (
+	formats,
+	composeImportProfile,
 	PRAGMATA_250707828,
-	PRAGMATA_MOTLIST_1057_EXACT_CAPABILITY,
-	PRAGMATA_MOTLIST_1057_MTRE_ONLY_CAPABILITY,
-	PRAGMATA_MOTLIST_1057_MULTI_CAPABILITY,
 	PRAGMATA_MPLY_250707828,
 )
 from re_engine_types import (
@@ -14,34 +14,75 @@ from re_engine_types import (
 )
 
 # Host/state/callback dependencies (resolved on use, never copied).
-RUNTIME_DEPENDENCIES = (
-	'NoeBitStream',
-	'NoeModel',
-	'NoeModelMaterials',
-	'PragmataMotlistSelectionSource',
-	'Version',
-	'_detectPragmataIdentity',
-	'_parsePragmataMeshData',
-	'_parsePragmataMplyData',
-	'buildPragmataMotlist1057Model',
-	'buildPragmataMotlist1057MultiModel',
-	'collapseBones',
-	'detectMeshCapability',
-	'detectPragmataMotlistCapability',
-	'dialogOptions',
-	'generateBoneMap',
-	'loadPragmataStreamingCompanion',
-	'meshFile',
-	'motlistFile',
-	'noesis',
-	'openOptionsDialogImportWindow',
-	'parsePragmataHeader',
-	'parsePragmataMplyHeader',
-	'rapi',
-	'sGameName',
-	'selectPragmataMotlistActions',
-	'shouldPromptPragmataMotlistSelection',
-)
+RUNTIME_DEPENDENCIES = ('NoeBitStream', 'NoeModel', 'NoeModelMaterials', 'Version', '_detectPragmataIdentity', '_parsePragmataMeshData', '_parsePragmataMplyData', 'collapseBones', 'detectMeshCapability', 'dialogOptions', 'generateBoneMap', 'loadPragmataStreamingCompanion', 'meshFile', 'noesis', 'openOptionsDialogImportWindow', 'parsePragmataHeader', 'parsePragmataMplyHeader', 'rapi', 'sGameName')
+
+
+
+def loadSelectedMeshes(runtime, session, dialog):
+	"""Load the ordered queue; retain the existing multi-profile restriction."""
+	initial_rule = session.profile["mesh"]["construction"]
+	# Initial MPLY affects sorting only if the final queue loads a strict mesh.
+	rule = "legacy-sort-fallback" if initial_rule == "mply-unsorted-strict" else initial_rule
+	stats = []
+	strict_suffixes = tuple(record["modelExt"] for record in formats.values()
+		if record["import"]["mesh"]["construction"] != "legacy-sort-fallback")
+	candidates = [path for path in dialog.fullLoadItems if path.lower().endswith(strict_suffixes)]
+	if len(candidates) > 1:
+		count = 0
+		for path in candidates:
+			capability = runtime.detectMeshCapability(runtime.rapi.loadIntoByteArray(path), path)
+			if capability in (PRAGMATA_250707828, PRAGMATA_MPLY_250707828):
+				count += 1
+		if count > 1:
+			print("RE_MESH_PROFILE_ERROR:multiple-pragmata-load-items")
+			return None
+	for path in dialog.fullLoadItems:
+		data = runtime.rapi.loadIntoByteArray(path)
+		if path == session.input_path:
+			mesh = runtime.meshFile(data, path, import_profile=session.profile)
+		else:
+			mesh = runtime.meshFile(data, path)
+		mesh.fullBoneList = session.resources["bones"]
+		mesh.fullRemapTable = session.resources["remap"]
+		mesh.fullTexList = session.resources["textures"]
+		mesh.fullMatList = session.resources["materials"]
+		mesh.loadMeshFile()
+		profile = getattr(mesh, "importProfile", None)
+		if profile is None:  # Existing callers may supply a mesh-compatible object.
+			profile = composeImportProfile(runtime.sGameName, formats[runtime.sGameName], mesh.capability)
+		incoming = profile["mesh"]["construction"]
+		if incoming != "legacy-sort-fallback":
+			if initial_rule == "mply-unsorted-strict":
+				rule = initial_rule
+			elif rule != "mply-unsorted-strict":
+				rule = incoming
+			if mesh.importStats is not None:
+				stats.append(mesh.importStats)
+	return rule, stats
+
+
+def constructImportedModel(runtime, construction_rule):
+	if construction_rule == "legacy-sort-fallback":
+		try:
+			model = runtime.rapi.rpgConstructModelAndSort()
+			if model.meshes[0].name.find("_") == 4:
+				print("\nWARNING: Noesis split detected!\n   Export this mesh to FBX with the advanced option '-fbxmeshmerge'\n")
+		except:
+			print("Failed to construct model from rpgeo context")
+			model = runtime.NoeModel()
+		return model
+	try:
+		model = (runtime.rapi.rpgConstructModel() if construction_rule == "mply-unsorted-strict"
+			else runtime.rapi.rpgConstructModelAndSort())
+	except Exception:
+		print("RE_MESH_PROFILE_ERROR:model-construction-failed")
+		return None
+	if not getattr(model, "meshes", None):
+		print("RE_MESH_PROFILE_ERROR:model-construction-failed")
+		return None
+	if model.meshes[0].name.find("_") == 4:
+		print("\nWARNING: Noesis split detected!\n   Export this mesh to FBX with the advanced option '-fbxmeshmerge'\n")
+	return model
 
 
 def bind(runtime):
@@ -86,66 +127,8 @@ def bind(runtime):
 	def motlistLoadModel(data, mdlList):
 		ctx = runtime.rapi.rpgCreateContext()
 		input_name = runtime.rapi.getInputName()
-		if input_name.lower().endswith(".motlist.1057"):
-			capability = runtime.detectPragmataMotlistCapability(data, input_name)
-			if capability == PRAGMATA_MOTLIST_1057_EXACT_CAPABILITY:
-				model = runtime.buildPragmataMotlist1057Model(data, input_name)
-			elif capability == PRAGMATA_MOTLIST_1057_MULTI_CAPABILITY:
-				decoded = re_common.decode_pragmata_motlist_1057_multi(
-					data, input_name, error_type=MeshProfileError)
-				selected_slots = None
-				if runtime.shouldPromptPragmataMotlistSelection():
-					selected_slots = runtime.selectPragmataMotlistActions(
-						decoded, input_name)
-					if selected_slots is None:
-						mdlList.append(runtime.NoeModel())
-						return 1
-				model = runtime.buildPragmataMotlist1057MultiModel(
-					data, input_name, selected_slots, decoded)
-			elif capability == PRAGMATA_MOTLIST_1057_MTRE_ONLY_CAPABILITY:
-				raise MeshProfileError("unsupported-motlist-content:mtre-only")
-			else:
-				raise MeshProfileError("unsupported-motlist-capability")
-			mdlList.append(model)
-			return 1
-
-		runtime.dialogOptions.motDialog = None
-		motlist = runtime.motlistFile(data, runtime.rapi.getInputName())
-		mlDialog = runtime.openOptionsDialogImportWindow(None, None, {"motlist":motlist, "isMotlist":True})
-		mlDialog.createMotlistWindow()
-
-		mdl = runtime.NoeModel()
-
-		if not mlDialog.isCancelled:
-			mdl.setBones(mlDialog.pak.bones)
-			runtime.collapseBones(mdl, 100)
-			bones = list(mdl.bones)
-			mdlBoneNames = [bone.name.lower() for bone in bones]
-			sortedMlists = []
-			for mlist in [mlDialog.loadedMlists[path] for path in mlDialog.fullLoadItems]:
-				if mlist not in sortedMlists:
-					sortedMlists.append(mlist)
-			for mlist in sortedMlists:
-				mlist.readBoneHeaders(mlDialog.loadItems)
-				for bone in mlist.bones:
-					if bone.name.lower() not in mdlBoneNames:
-						bone.index = len(bones)
-						bones.append(bone)
-			anims = []
-			for mlist in sortedMlists:
-				mlist.bones = bones
-				mlist.readBoneHeaders(mlDialog.loadItems)
-				mlist.read(mlDialog.loadItems)
-			for mlist in sortedMlists:
-				mlist.makeAnims(mlDialog.loadItems)
-				anims.extend(mlist.anims)
-
-			mdl.setBones(bones)
-			mdl.setAnims(anims)
-			runtime.rapi.setPreviewOption("setAnimSpeed", "60.0")
-
-		mdlList.append(mdl)
-
+		beginImportSession(runtime, "motion", input_name)
+		mdlList.append(loadMotionImport(runtime, data, input_name))
 		return 1
 
 	def meshLoadModel(data, mdlList):
@@ -154,20 +137,24 @@ def bind(runtime):
 		print("\n\n	RE Engine MESH model import", runtime.Version, "by alphaZomega\n")
 
 		ctx = runtime.rapi.rpgCreateContext()
+		session = beginImportSession(runtime, "mesh", runtime.rapi.getInputName())
 		mesh = runtime.meshFile(data)
+		session.profile = getattr(mesh, "importProfile", None)
+		session.resources = {"bones": mesh.fullBoneList, "remap": mesh.fullRemapTable,
+			"textures": mesh.fullTexList, "materials": mesh.fullMatList}
 		# This object supplies selection state; actual loads use separate instances.
 		mesh._profileSnapshot = None
 		mesh.setGameName()
-		isPragmataLoad = mesh.capability == PRAGMATA_250707828
-		isPragmataMplyLoad = mesh.capability == PRAGMATA_MPLY_250707828
+		if session.profile is None:
+			session.profile = composeImportProfile(runtime.sGameName, formats[runtime.sGameName], mesh.capability)
 		pragmataStats = []
 		runtime.dialogOptions.motDialog = None
 		runtime.dialogOptions.dialog = None
 		runtime.dialogOptions.currentDir = ""
 		meshGame = runtime.sGameName
 		meshArgs = {"mesh": mesh}
-		if isPragmataLoad:
-			meshArgs["animationSource"] = runtime.PragmataMotlistSelectionSource
+		if session.profile["mesh"]["construction"] != "mply-unsorted-strict":
+			meshArgs["animationSource"] = makeAnimationSelectionSource(runtime, session.profile)
 		dialog = runtime.openOptionsDialogImportWindow(None, None, meshArgs)
 		dialog.path = runtime.rapi.getInputName()
 		dialog.createMeshWindow()
@@ -187,54 +174,13 @@ def bind(runtime):
 				dialog.createMeshWindow()
 
 		if not dialog.isCancelled:
-			pragmataCandidatePaths = [
-				path for path in dialog.fullLoadItems
-				if path.lower().endswith(".251121828")
-			]
-			if len(pragmataCandidatePaths) > 1:
-				pragmataLoadCount = 0
-				for fullMeshPath in pragmataCandidatePaths:
-					capability = runtime.detectMeshCapability(
-						runtime.rapi.loadIntoByteArray(fullMeshPath), fullMeshPath
-					)
-					if capability in (PRAGMATA_250707828, PRAGMATA_MPLY_250707828):
-						pragmataLoadCount += 1
-				if pragmataLoadCount > 1:
-					print("RE_MESH_PROFILE_ERROR:multiple-pragmata-load-items")
-					return 0
-			for fullMeshPath in dialog.fullLoadItems:
-				meshToLoad = runtime.meshFile(runtime.rapi.loadIntoByteArray(fullMeshPath), fullMeshPath)
-				meshToLoad.fullBoneList = dialog.pak.fullBoneList
-				meshToLoad.fullRemapTable = dialog.pak.fullRemapTable
-				meshToLoad.fullTexList = dialog.pak.fullTexList
-				meshToLoad.fullMatList = dialog.pak.fullMatList
-				meshToLoad.loadMeshFile()
-				if meshToLoad.capability in (PRAGMATA_250707828, PRAGMATA_MPLY_250707828):
-					isPragmataLoad = True
-					if meshToLoad.capability == PRAGMATA_MPLY_250707828:
-						isPragmataMplyLoad = True
-					if meshToLoad.importStats is not None:
-						pragmataStats.append(meshToLoad.importStats)
-			if isPragmataLoad:
-				try:
-					mdl = (runtime.rapi.rpgConstructModel() if isPragmataMplyLoad else
-						runtime.rapi.rpgConstructModelAndSort())
-				except Exception:
-					print("RE_MESH_PROFILE_ERROR:model-construction-failed")
-					return 0
-				if not getattr(mdl, "meshes", None):
-					print("RE_MESH_PROFILE_ERROR:model-construction-failed")
-					return 0
-				if mdl.meshes[0].name.find("_") == 4:
-					print ("\nWARNING: Noesis split detected!\n   Export this mesh to FBX with the advanced option '-fbxmeshmerge'\n")
-			else:
-				try:
-					mdl = runtime.rapi.rpgConstructModelAndSort()
-					if mdl.meshes[0].name.find("_") == 4:
-						print ("\nWARNING: Noesis split detected!\n   Export this mesh to FBX with the advanced option '-fbxmeshmerge'\n")
-				except:
-					print("Failed to construct model from rpgeo context")
-					mdl = runtime.NoeModel()
+			loaded = loadSelectedMeshes(runtime, session, dialog)
+			if loaded is None:
+				return 0
+			construction_rule, pragmataStats = loaded
+			mdl = constructImportedModel(runtime, construction_rule)
+			if mdl is None:
+				return 0
 		else:
 			mdl = runtime.NoeModel()
 
@@ -242,44 +188,8 @@ def bind(runtime):
 		mlDialog = runtime.dialogOptions.motDialog
 		if mlDialog and mlDialog.selectionOnly:
 			doLoadAnims = bool(mlDialog.selectedActions) and not mlDialog.isCancelled and not dialog.isCancelled
-		if doLoadAnims and mlDialog.selectionOnly:
-			firstSelection = mlDialog.selectedActions[0]
-			animationModel = runtime.buildPragmataMotlist1057MultiModel(
-				b"", firstSelection["path"], mlDialog.selectedActions,
-				firstSelection["decoded"], mesh_bones=dialog.pak.fullBoneList)
-			mdl.setBones(animationModel.bones)
-			mdl.setAnims(animationModel.anims)
-		elif doLoadAnims:
-			sortedMlists = []
-			for mlist in [mlDialog.loadedMlists[path] for path in mlDialog.fullLoadItems]:
-				if mlist not in sortedMlists:
-					sortedMlists.append(mlist)
-			motlist = mlDialog.pak
-			mdl.setBones(dialog.pak.fullBoneList)
-			runtime.collapseBones(mdl, 100)
-			bones = list(mdl.bones)
-			mdlBoneNames = [bone.name.lower() for bone in bones]
-			for mlist in sortedMlists:
-				mlist.meshBones = bones
-				mlist.readBoneHeaders(mlDialog.loadItems)
-				for bone in mlist.bones:
-					if bone.name.lower() not in mdlBoneNames:
-						bone.index = len(bones)
-						bones.append(bone)
-			anims = []
-			startFrame = 0
-			for mlist in sortedMlists:
-				mlist.bones = bones
-				mlist.readBoneHeaders(mlDialog.loadItems)
-				mlist.totalFrames = startFrame
-				mlist.read(mlDialog.loadItems)
-				startFrame = mlist.totalFrames
-			for mlist in sortedMlists:
-				mlist.makeAnims(mlDialog.loadItems)
-				anims.extend(mlist.anims)
-			mdl.setBones(bones)
-			mdl.setAnims(anims)
-			runtime.rapi.setPreviewOption("setAnimSpeed", "60.0")
+		if doLoadAnims:
+			attachSelectedAnimations(runtime, mdl, mlDialog, dialog.pak.fullBoneList, "mesh")
 		else:
 			mdl.setBones(dialog.pak.fullBoneList)
 

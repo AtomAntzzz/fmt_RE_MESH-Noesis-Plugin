@@ -21,38 +21,48 @@ RUNTIME_DEPENDENCIES = (
 )
 
 
+def _materialNativesRoot(meshPath, format_record):
+	normalizedMesh = meshPath.replace("/", "\\")
+	lowerMesh = normalizedMesh.lower()
+	meshSuffix = ".mesh" + format_record["modelExt"]
+	if not lowerMesh.endswith(meshSuffix):
+		raise MaterialProfileError("mesh-suffix-mismatch")
+	marker = "\\natives\\" + format_record["nDir"] + "\\"
+	markerIndex = lowerMesh.find(marker)
+	if markerIndex < 0:
+		raise MaterialProfileError("natives-root-missing")
+	return (normalizedMesh, normalizedMesh[:markerIndex + len(marker)])
+
+def resolveTextureResourcePath(meshPath, textureResourcePath, format_record):
+	normalizedMesh, nativesRoot = _materialNativesRoot(meshPath, format_record)
+	resourcePath = textureResourcePath.replace("/", "\\")
+	components = resourcePath.split("\\")
+	if (not resourcePath.lower().endswith(".tex") or resourcePath.startswith("\\")
+			or ":" in resourcePath or not components
+			or any([component in ("", ".", "..") for component in components])):
+		raise MaterialProfileError("texture-resource-path-mismatch")
+	targetPath = os.path.normpath(nativesRoot + resourcePath + format_record["texExt"])
+	rootPrefix = os.path.normcase(os.path.normpath(nativesRoot) + os.sep)
+	if not os.path.normcase(targetPath).startswith(rootPrefix):
+		raise MaterialProfileError("texture-resource-path-mismatch")
+	return targetPath
+
+def resolveMaterialCompanionPath(meshPath, format_record):
+	meshSuffix = ".mesh" + format_record["modelExt"]
+	if not meshPath.lower().endswith(meshSuffix):
+		raise MaterialProfileError("mesh-suffix-mismatch")
+	return meshPath[:-len(meshSuffix)] + "_mat" + format_record["mdfExt"]
+
+
 def bind(runtime):
 	def _pragmataNativesRoot(meshPath):
-		normalizedMesh = meshPath.replace("/", "\\")
-		lowerMesh = normalizedMesh.lower()
-		meshSuffix = ".mesh" + formats["PRAGMATA"]["modelExt"]
-		if not lowerMesh.endswith(meshSuffix):
-			raise MaterialProfileError("mesh-suffix-mismatch")
-		marker = "\\natives\\stm\\"
-		markerIndex = lowerMesh.find(marker)
-		if markerIndex < 0:
-			raise MaterialProfileError("natives-root-missing")
-		return (normalizedMesh, normalizedMesh[:markerIndex + len(marker)])
+		return _materialNativesRoot(meshPath, formats["PRAGMATA"])
 
 	def resolvePragmataTexturePath(meshPath, textureResourcePath):
-		normalizedMesh, nativesRoot = runtime._pragmataNativesRoot(meshPath)
-		resourcePath = textureResourcePath.replace("/", "\\")
-		components = resourcePath.split("\\")
-		if (not resourcePath.lower().endswith(".tex") or resourcePath.startswith("\\")
-				or ":" in resourcePath or not components
-				or any([component in ("", ".", "..") for component in components])):
-			raise MaterialProfileError("texture-resource-path-mismatch")
-		targetPath = os.path.normpath(nativesRoot + resourcePath + formats["PRAGMATA"]["texExt"])
-		rootPrefix = os.path.normcase(os.path.normpath(nativesRoot) + os.sep)
-		if not os.path.normcase(targetPath).startswith(rootPrefix):
-			raise MaterialProfileError("texture-resource-path-mismatch")
-		return targetPath
+		return resolveTextureResourcePath(meshPath, textureResourcePath, formats["PRAGMATA"])
 
 	def resolvePragmataMdfPath(meshPath):
-		meshSuffix = ".mesh" + formats["PRAGMATA"]["modelExt"]
-		if not meshPath.lower().endswith(meshSuffix):
-			raise MaterialProfileError("mesh-suffix-mismatch")
-		return meshPath[:-len(meshSuffix)] + "_mat" + formats["PRAGMATA"]["mdfExt"]
+		return resolveMaterialCompanionPath(meshPath, formats["PRAGMATA"])
 
 	def resolvePragmataMaterialCompanions(meshPath, textureResourcePath):
 		normalizedMesh, nativesRoot = runtime._pragmataNativesRoot(meshPath)

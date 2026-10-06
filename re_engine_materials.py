@@ -2,10 +2,14 @@
 
 import re_engine_common as re_common
 import struct
+from re_engine_types import _materialCheckedRange, _materialScalar
+import re_engine_tex as texture_import
+from re_engine_paths import resolveMaterialCompanionPath, resolveTextureResourcePath
 from re_engine_config import (
 	MDF2_51_EXACT_TEXTURE_COUNT,
 	MDF2_51_EXACT_PROPERTY_COUNT,
 	formats,
+	composeImportProfile,
 	MDF2_51_ENTRY_SIZE,
 	MDF2_51_PROPERTY_ENTRY_SIZE,
 	MDF2_51_TEXTURE_ENTRY_SIZE,
@@ -27,18 +31,6 @@ def _new_material(material_type, name):
 	material.setDefaultBlend(0)
 	return material
 
-
-def _materialCheckedRange(data, start, size, label):
-	def materialRangeError(token):
-		prefix = "offset-out-of-bounds:"
-		if token.startswith(prefix):
-			token = token[len(prefix):] + "-out-of-bounds"
-		return MaterialProfileError(token)
-	return re_common.checked_range(data, start, size, label, materialRangeError)
-
-def _materialScalar(data, offset, fmt, label):
-	_materialCheckedRange(data, offset, struct.calcsize(fmt), label)
-	return re_common.read_scalar(data, offset, fmt, label, MaterialProfileError)
 
 def _materialUtf16z(data, offset, limit, label):
 	return re_common.read_utf16z(
@@ -304,10 +296,7 @@ MESH_RUNTIME_DEPENDENCIES = (
 	'noesis',
 	'parsePragmataMdf2Profile',
 	'rapi',
-	'resolvePragmataMdfPath',
-	'resolvePragmataTexturePath',
 	'sGameName',
-	'texLoadDDS',
 	'texOutputExt',
 )
 
@@ -393,6 +382,16 @@ def readLegacyMaterialTexture(bs, version, entry, index, read_string):
 	return {"slot": slot, "path": path, "hash": row[1]}
 
 
+def loadMeshMaterials(mesh, material_names=None, material_count=None):
+	"""Select only the material component; its commit/error policy stays local."""
+	family = mesh.importProfile["material"]["family"]
+	if family == "legacy":
+		return mesh.createMaterials(material_count if material_count is not None else len(material_names))
+	if family == "mdf-51-observed":
+		return mesh._loadPragmataMaterialProfile(material_names if material_names is not None else mesh.matNames)
+	raise MaterialProfileError("unsupported-material-import-family")
+
+
 def bind_mesh_materials(runtime):
 	def createMaterials(self, matCount):
 		# Shared state is owned by runtime.
@@ -402,11 +401,16 @@ def bind_mesh_materials(runtime):
 		noMDFFound = 0
 		skipPrompt = 0
 
-		modelExt = formats[runtime.sGameName]["modelExt"]
-		texExt = formats[runtime.sGameName]["texExt"]
-		mmtrExt = formats[runtime.sGameName]["mmtrExt"]
-		nDir = formats[runtime.sGameName]["nDir"]
-		mdfExt = formats[runtime.sGameName]["mdfExt"]
+		import_profile = getattr(self, "importProfile", None)
+		if import_profile is None:
+			import_profile = composeImportProfile(runtime.sGameName, formats[runtime.sGameName])
+		metadata = import_profile["format"]
+		material_rules = import_profile["material"]
+		modelExt = metadata["modelExt"]
+		texExt = metadata["texExt"]
+		mmtrExt = metadata["mmtrExt"]
+		nDir = metadata["nDir"]
+		mdfExt = metadata["mdfExt"]
 
 		if runtime.extractedNativesPath != "":
 			print ("Using this extracted natives path:", runtime.extractedNativesPath + "\n")
@@ -427,7 +431,7 @@ def bind_mesh_materials(runtime):
 			pathPrefix = pathPrefix.replace("out.",".")
 		pathPrefix = pathPrefix.replace(".mesh", "").replace(modelExt,"").replace(".NEW", "")
 
-		if runtime.sGameName == "ReVerse" and os.path.isdir(os.path.dirname(inputName) + "\\Material"):
+		if material_rules["sibling_directory"] and os.path.isdir(os.path.dirname(inputName) + "\\" + material_rules["sibling_directory"]):
 			pathPrefix = (os.path.dirname(inputName) + "\\Material\\" + runtime.rapi.getLocalFileName(inputName).replace("SK_", "M_")).replace(".NEW", "")
 			while pathPrefix.find("out.") != -1:
 				pathPrefix = pathPrefix.replace("out.",".")
@@ -680,9 +684,9 @@ def bind_mesh_materials(runtime):
 						else:
 							textureFilePath = self.rootDir + textureName + tmpExt
 							texName = runtime.rapi.getLocalFileName(self.rootDir + textureName).rsplit('.', 1)[0] + runtime.texOutputExt
-							if runtime.bPrintFileList and not (textureFilePath.endswith("rtex" + tmpExt)) and (k==1 or runtime.sGameName.find("MHR") == -1):
+							if runtime.bPrintFileList and not (textureFilePath.endswith("rtex" + tmpExt)) and (k==1 or not material_rules["stm_retry"]):
 								self.missingTexNames.append("DOES NOT EXIST: " + ('natives/' + (re.sub(r'.*natives\\', '', textureFilePath)).lower()).replace("\\","/").replace("streaming/",""))
-						if "MHR" not in runtime.sGameName:
+						if not material_rules["stm_retry"]:
 							break
 						tmpExt += ".stm"
 
@@ -710,7 +714,7 @@ def bind_mesh_materials(runtime):
 						extraParam = "isALBM"
 					if "Dielectric" in textureType:
 						extraParam = "isALBD"
-					self.uvBias[material.name] = [0.5, 0.5] if runtime.sGameName == "RE7RT" and "atlas" in lowerTexName else 1.0
+					self.uvBias[material.name] = [0.5, 0.5] if material_rules["atlas_uv"] and "atlas" in lowerTexName else 1.0
 				#elif (("Normal" in textureType or "NR" in textureType) or "_nr" in lowerTexName) and not bFoundNM:
 				elif "_nr" in lowerTexName and not bFoundNM:
 					bFoundNM = True
@@ -744,7 +748,7 @@ def bind_mesh_materials(runtime):
 					else:
 						textureData = runtime.rapi.loadIntoByteArray(textureFilePath)
 						numTex = len(self.texList)
-						noetex = runtime.texLoadDDS(textureData, self.texList, texName)
+						noetex = texture_import.loadTextureForImport(runtime, textureData, self.texList, texName, textureFilePath, import_profile["texture"])
 						if noetex:
 							if runtime.dialogOptions.doConvertTex:
 								if "isALBM"  == extraParam or "isALBD" == extraParam:
@@ -896,7 +900,10 @@ def bind_mesh_materials(runtime):
 		return True
 
 	def _loadPragmataMaterialProfile(self, meshMaterialNames, pragmataDecoder=None):
-		mdfPath = runtime.resolvePragmataMdfPath(self.path)
+		import_profile = getattr(self, "importProfile", None)
+		if import_profile is None:
+			import_profile = composeImportProfile("PRAGMATA", formats["PRAGMATA"])
+		mdfPath = resolveMaterialCompanionPath(self.path, import_profile["format"])
 		if not runtime.rapi.checkFileExists(mdfPath):
 			print("PRAGMATA MDF2 exact companion not found:", mdfPath)
 			return False
@@ -917,7 +924,7 @@ def bind_mesh_materials(runtime):
 						builderTexture["semantic"] = "diagnostic-mask"
 						builderTexture["preview_use"] = "diagnostic-diffuse"
 					if builderTexture.get("preview_use") in ("preview-mapping", "diagnostic-diffuse"):
-						texPath = runtime.resolvePragmataTexturePath(self.path, builderTexture["path"])
+						texPath = resolveTextureResourcePath(self.path, builderTexture["path"], import_profile["format"])
 						if not runtime.rapi.checkFileExists(texPath):
 							if builderTexture.get("preview_use") == "diagnostic-diffuse":
 								raise MaterialProfileError("tex-companion-missing")
@@ -942,8 +949,8 @@ def bind_mesh_materials(runtime):
 						break
 				texBaseName = os.path.basename(resourcePath.replace("/", "\\"))
 				texName = texBaseName[:-4] + runtime.texOutputExt
-				loadedTexture = runtime.texLoadDDS(
-					texData, stagedTextures, texName, texPath, pragmataDecoder
+				loadedTexture = texture_import.loadTextureForImport(
+					runtime, texData, stagedTextures, texName, texPath, import_profile["texture"], pragmataDecoder
 				)
 				if not loadedTexture:
 					raise MaterialProfileError("tex-decode-failed")

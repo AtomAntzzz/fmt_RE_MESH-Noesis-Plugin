@@ -4,10 +4,13 @@ import json
 import math
 import os
 import struct
+from copy import deepcopy
+from re_engine_materials import loadMeshMaterials
 from re_engine_config import (
 	PRAGMATA_250707828,
 	PRAGMATA_MPLY_250707828,
 	formats,
+	composeImportProfile,
 )
 from re_engine_types import (
 	MeshProfileError,
@@ -82,6 +85,12 @@ def getLegacyMeshLayout(ver, game_name):
 		layout["namesOffsLocation"] = 136 # on unrigged meshes its still 144
 
 	return layout
+
+
+def bindMeshMaterial(runtime, material_name):
+	runtime.rapi.rpgSetMaterial(material_name)
+	runtime.rapi.rpgSetPosScaleBias(
+		(runtime.fDefaultMeshScale, runtime.fDefaultMeshScale, runtime.fDefaultMeshScale), (0, 0, 0))
 
 
 def bindMeshVertexStreams(rapi, streams):
@@ -170,7 +179,7 @@ def bind(runtime):
 
 	class meshFile(object):
 
-		def __init__(self, data, path=""):
+		def __init__(self, data, path="", import_profile=None, session=None):
 			self.path = path or runtime.rapi.getInputName()
 			self.data = data
 			self.inFile = runtime.NoeBitStream(data)
@@ -192,12 +201,22 @@ def bind(runtime):
 			self.fullTexList = []
 			self.fullMatList = []
 			self.fullRemapTable = []
+			if session is not None:
+				self.fullBoneList = session.resources["bones"]
+				self.fullRemapTable = session.resources["remap"]
+				self.fullTexList = session.resources["textures"]
+				self.fullMatList = session.resources["materials"]
 			self.blendShapeNamesByMesh = {}
 			self.setGameName()
-			self.gameName = runtime.sGameName
-			self.ver = formats[runtime.sGameName]["meshVersion"]
-			self.layout = getLegacyMeshLayout(self.ver, self.gameName)
-			self.mdfVer = formats[runtime.sGameName]["mdfVersion"]
+			identified = composeImportProfile(runtime.sGameName, formats[runtime.sGameName], self.capability)
+			self.importProfile = deepcopy(import_profile) if import_profile is not None else identified
+			if self.importProfile["mesh"]["family"] != identified["mesh"]["family"]:
+				raise MeshProfileError("structural-profile-mismatch:mesh-import-family")
+			self.gameName = self.importProfile["game_name"]
+			self.ver = self.importProfile["format"]["meshVersion"]
+			self.layout = getLegacyMeshLayout(self.ver, runtime.sGameName)
+			self.layout["namesOffsLocation"] = self.importProfile["mesh"]["names_offset"]
+			self.mdfVer = self.importProfile["format"]["mdfVersion"]
 			self.name = "LOD" if runtime.bShorterNames else "LODGroup"
 			self.meshFile = None
 			self.mdfFile = None
@@ -277,7 +296,7 @@ def bind(runtime):
 			full_remap_offset = len(self.fullRemapTable)
 			self.materializedPreview = False
 			if runtime.bMaterialsEnabled:
-				self.materializedPreview = self._loadPragmataMaterialProfile(parsed["material_names"])
+				self.materializedPreview = loadMeshMaterials(self, parsed["material_names"])
 
 			self.boneList = []
 			for bone in parsed["bones"]:
@@ -332,10 +351,7 @@ def bind(runtime):
 				if material_name not in self.matNames:
 					self.matNames.append(material_name)
 				runtime.rapi.rpgSetName(mesh_name + "__" + material_name if runtime.bImportMaterialNames else mesh_name)
-				runtime.rapi.rpgSetMaterial(material_name)
-				runtime.rapi.rpgSetPosScaleBias(
-					(runtime.fDefaultMeshScale, runtime.fDefaultMeshScale, runtime.fDefaultMeshScale), (0, 0, 0)
-				)
+				bindMeshMaterial(runtime, material_name)
 
 				def profileVertexStreams():
 					vertex_start = submesh["vertex_start"]
@@ -396,7 +412,7 @@ def bind(runtime):
 
 			#Try to find & save extracted game dir for later if extracted game dir is unknown
 			if runtime.extractedNativesPath == "":
-				if (self.rootDir.lower().endswith("chunk_000\\natives\\" + formats[runtime.sGameName]["nDir"] + "\\")):
+				if (self.rootDir.lower().endswith("chunk_000\\natives\\" + self.importProfile["format"]["nDir"] + "\\")):
 					print ("Saving extracted natives path...")
 					if runtime.SaveExtractedDir(self.rootDir, runtime.sGameName):
 						runtime.extractedNativesPath = self.rootDir
@@ -433,7 +449,7 @@ def bind(runtime):
 				intFaces = countArray[6]
 				bLoadedMats = False
 				if not (runtime.noesis.optWasInvoked("-noprompt")) and not runtime.bRenameMeshesToFilenames and not runtime.rapi.noesisIsExporting() and not (runtime.dialogOptions.dialog != None and runtime.dialogOptions.doLoadTex == False):
-					bLoadedMats = self.createMaterials(matCount)
+					bLoadedMats = loadMeshMaterials(self, material_count=matCount)
 				if runtime.bDebugMESH:
 					print("Count Array")
 					print(countArray)
@@ -449,7 +465,7 @@ def bind(runtime):
 				faceBuffOffs = face_buffOffsSF6 + vertBuffOffs;
 			else:
 				faceBuffOffs = bs.readUInt64()
-				if runtime.sGameName == "RERT" or runtime.sGameName == "RE7RT" or runtime.sGameName == "MHRSunbreak":
+				if self.importProfile["mesh"]["vertex_header_extra"]:
 					uknInt64 = bs.readUInt64()
 				vertBuffSize = bs.readUInt()
 				faceBuffSize = bs.readUInt()
@@ -544,7 +560,7 @@ def bind(runtime):
 					boneMapCount = bs.readUInt()
 					bAddNumbers = False
 					if runtime.rapi.getInputName().find(".noesis") == -1 and (not runtime.dialogOptions.dialog or len(runtime.dialogOptions.dialog.loadItems) == 1) and (not runtime.dialogOptions.motDialog or not runtime.dialogOptions.motDialog.loadItems) :
-						maxBones = 1024 if runtime.sGameName == "SF6" else 256
+						maxBones = self.importProfile["mesh"]["bone_capacity"]
 						if runtime.bAddBoneNumbers == 1 or runtime.noesis.optWasInvoked("-bonenumbers"):
 							bAddNumbers = True
 						elif runtime.bAddBoneNumbers == 2 and boneCount > maxBones and runtime.rapi.getInputName().lower().find(".scn") == -1:
@@ -654,7 +670,7 @@ def bind(runtime):
 						self.groupIDs.append(meshVertexInfo[len(meshVertexInfo)-1][0])
 						submeshData = []
 						for k in range(meshVertexInfo[j][1]):
-							if runtime.sGameName == "DRDR":
+							if self.importProfile["mesh"]["submesh"] == "drdr":
 								submeshData.append([bs.readUShort(), bs.readUShort(), bs.readUInt(), bs.readUInt(), bs.readUInt(), bs.readUInt(), bs.readUInt64(), self.groupIDs[len(self.groupIDs)-1], bs.readUInt()])
 								del submeshData[len(submeshData)-1][2] #this is something new, not sure
 							elif self.ver >= 2:
@@ -717,8 +733,7 @@ def bind(runtime):
 
 								matName = self.matNames[len(self.matNames)-1]
 
-							runtime.rapi.rpgSetMaterial(matName)
-							runtime.rapi.rpgSetPosScaleBias((runtime.fDefaultMeshScale, runtime.fDefaultMeshScale, runtime.fDefaultMeshScale), (0, 0, 0))
+							bindMeshMaterial(runtime, matName)
 							if runtime.bImportMaterialNames:
 								#rapi.rpgSetName(meshName + "__" + matName + "__" + str(submeshData[k][len(submeshData[k])-1]))
 								runtime.rapi.rpgSetName(meshName + '__' + matName)
@@ -760,7 +775,7 @@ def bind(runtime):
 									yield ("bone_map", (self.fullRemapTable,))
 									idxList = []
 									start = vertexStartIndex + vertElemHeaders[weightIndex][2] + (vertElemHeaders[weightIndex][1] * vertsBefore)
-									if runtime.sGameName == "SF6":
+									if self.importProfile["mesh"]["bone_codec"] == "six-u10":
 										for v in range(numVerts):
 											bs.seek(start + vertElemHeaders[weightIndex][1] * v)
 											for bID in range(3):

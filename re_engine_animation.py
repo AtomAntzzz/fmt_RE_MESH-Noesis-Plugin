@@ -6,6 +6,8 @@ import copy
 import re_engine_common as re_common
 import struct
 from re_engine_config import (
+	formats,
+	composeImportProfile,
 	PRAGMATA_MOTLIST_1057_EXACT_CAPABILITY,
 	PRAGMATA_MOTLIST_1057_MTRE_ONLY_CAPABILITY,
 	PRAGMATA_MOTLIST_1057_MULTI_CAPABILITY,
@@ -65,8 +67,32 @@ def setKeyFramedComponent(runtime, bone, kind, keys):
 
 class LegacyMotlistSelectionSource:
 	"""Legacy loading policy used by the same public selection window."""
-	def __init__(self, runtime):
+	selectionOnly = False
+	previewSpeed = "60.0"
+	def __init__(self, runtime, import_profile=None):
 		self.runtime = runtime
+		if import_profile is not None:
+			self.gameName = import_profile["game_name"]
+			self.fileSuffix = import_profile["motion"]["file_suffix"]
+
+	def loadFile(self, path, cache):
+		return self.load(path)
+
+	def optionEnabled(self, option_name):
+		return True
+
+	def acceptSelection(self, dialog):
+		dialog.isOpen = False
+		if dialog.isMotlist:
+			dialog.loadedMlists = {}
+			self.prepareSelection(dialog.pak, dialog.loadItems, dialog.fullLoadItems, dialog.loadedMlists)
+		return True
+
+	def isNewItem(self, dialog, item):
+		return item not in dialog.loadItems
+
+	def buildForModel(self, model, dialog, target_bones, mode):
+		return buildLegacySelectedAnimations(self.runtime, model, dialog, target_bones, mode)
 
 	def load(self, path):
 		return self.runtime.motlistFile(self.runtime.rapi.loadIntoByteArray(path), path)
@@ -87,6 +113,166 @@ class LegacyMotlistSelectionSource:
 					if motion.name not in load_items:
 						load_items.append(motion.name)
 						paths.append(path)
+
+
+class CachedMotlistSelectionSource:
+	"""Path/slot selection policy, including compatibility with injected sources."""
+	selectionOnly = True
+	previewSpeed = None
+	def __init__(self, runtime, source_type, import_profile=None):
+		self.runtime = runtime
+		self.sourceType = source_type
+		self.gameName = import_profile["game_name"] if import_profile is not None else source_type.gameName
+		self.fileSuffix = import_profile["motion"]["file_suffix"] if import_profile is not None else source_type.fileSuffix
+
+	def loadFile(self, path, cache):
+		if path not in cache:
+			cache[path] = self.sourceType.load(path)
+		return cache[path]
+
+	def optionEnabled(self, option_name):
+		return False
+
+	def isNewItem(self, dialog, item):
+		return (item, dialog.pak.path) not in zip(dialog.loadItems, dialog.fullLoadItems)
+
+	def resolveSelection(self, dialog):
+		if len(dialog.loadItems) != len(dialog.fullLoadItems):
+			raise MeshProfileError("structural-profile-mismatch:animation-selection")
+		selections = []
+		seen = set()
+		for item, path in zip(dialog.loadItems, dialog.fullLoadItems):
+			source = dialog.selectionSources.get(path)
+			if source is None:
+				raise MeshProfileError("structural-profile-mismatch:animation-selection")
+			for slot_index in source.slots_for_items([item]):
+				identity = (path, slot_index)
+				if identity not in seen:
+					seen.add(identity)
+					selections.append(source.selection_for_slot(slot_index))
+		return selections
+
+	def acceptSelection(self, dialog):
+		selected = self.resolveSelection(dialog)
+		if not selected:
+			return False
+		dialog.selectedActions = selected
+		dialog.isOpen = False
+		return True
+
+	def buildForModel(self, model, dialog, target_bones, mode):
+		first = dialog.selectedActions[0]
+		animation_model = self.runtime.buildPragmataMotlist1057MultiModel(
+			b"", first["path"], dialog.selectedActions, first["decoded"],
+			mesh_bones=target_bones if mode == "mesh" else None)
+		return animation_model.bones, animation_model.anims
+
+
+def makeAnimationSelectionSource(runtime, import_profile):
+	family = import_profile["motion"]["family"]
+	if family == "legacy":
+		return LegacyMotlistSelectionSource(runtime, import_profile)
+	if family == "motlist-1057-mot-993":
+		return CachedMotlistSelectionSource(runtime, runtime.PragmataMotlistSelectionSource, import_profile)
+	raise MeshProfileError("unsupported-motion-import-family")
+
+
+def buildLegacySelectedAnimations(runtime, model, dialog, target_bones, mode):
+	# Keep the two historical collapse/list-read orderings, including failures.
+	if mode == "standalone":
+		model.setBones(target_bones)
+		runtime.collapseBones(model, 100)
+		bones = list(model.bones)
+		model_names = [bone.name.lower() for bone in bones]
+	lists = []
+	for motion_list in [dialog.loadedMlists[path] for path in dialog.fullLoadItems]:
+		if motion_list not in lists:
+			lists.append(motion_list)
+	if mode == "mesh":
+		model.setBones(target_bones)
+		runtime.collapseBones(model, 100)
+		bones = list(model.bones)
+		model_names = [bone.name.lower() for bone in bones]
+	for motion_list in lists:
+		if mode == "mesh":
+			motion_list.meshBones = bones
+		motion_list.readBoneHeaders(dialog.loadItems)
+		for bone in motion_list.bones:
+			if bone.name.lower() not in model_names:
+				bone.index = len(bones)
+				bones.append(bone)
+	anims = []
+	start_frame = 0
+	for motion_list in lists:
+		motion_list.bones = bones
+		motion_list.readBoneHeaders(dialog.loadItems)
+		if mode == "mesh":
+			motion_list.totalFrames = start_frame
+		motion_list.read(dialog.loadItems)
+		if mode == "mesh":
+			start_frame = motion_list.totalFrames
+	for motion_list in lists:
+		motion_list.makeAnims(dialog.loadItems)
+		anims.extend(motion_list.anims)
+	return bones, anims
+
+
+def attachSelectedAnimations(runtime, model, dialog, target_bones, mode):
+	if dialog is None or dialog.isCancelled:
+		return False
+	source = getattr(dialog, "sourceOperations", None)
+	if source is None:  # Compatibility for external dialog-compatible callers.
+		source = (CachedMotlistSelectionSource(runtime, runtime.PragmataMotlistSelectionSource)
+			if getattr(dialog, "selectionOnly", False) else LegacyMotlistSelectionSource(runtime))
+	if source.selectionOnly and not dialog.selectedActions:
+		return False
+	bones, anims = source.buildForModel(model, dialog, target_bones, mode)
+	model.setBones(bones)
+	model.setAnims(anims)
+	if source.previewSpeed is not None:
+		runtime.rapi.setPreviewOption("setAnimSpeed", source.previewSpeed)
+	return True
+
+
+def loadMotionImport(runtime, data, path, import_profile=None):
+	if import_profile is None:
+		# Preserve the original modern-suffix priority; old motlistFile still
+		# performs its original game detection when it is constructed below.
+		game = runtime.sGameName if runtime.sGameName in formats else "RE2"
+		for name, record in formats.items():
+			if (record["import"]["motion"]["family"] != "legacy" and
+					path.lower().endswith(record["import"]["motion"]["file_suffix"])):
+				game = name
+				break
+		else:
+			if formats[game]["import"]["motion"]["family"] != "legacy":
+				game = "RE2"
+		import_profile = composeImportProfile(game, formats[game])
+	if import_profile["motion"]["family"] == "motlist-1057-mot-993":
+		capability = runtime.detectPragmataMotlistCapability(data, path)
+		if capability == PRAGMATA_MOTLIST_1057_EXACT_CAPABILITY:
+			return runtime.buildPragmataMotlist1057Model(data, path)
+		if capability == PRAGMATA_MOTLIST_1057_MULTI_CAPABILITY:
+			decoded = re_common.decode_pragmata_motlist_1057_multi(data, path, error_type=MeshProfileError)
+			selected = None
+			if runtime.shouldPromptPragmataMotlistSelection():
+				selected = runtime.selectPragmataMotlistActions(decoded, path)
+				if selected is None:
+					return runtime.NoeModel()
+			return runtime.buildPragmataMotlist1057MultiModel(data, path, selected, decoded)
+		if capability == PRAGMATA_MOTLIST_1057_MTRE_ONLY_CAPABILITY:
+			raise MeshProfileError("unsupported-motlist-content:mtre-only")
+		raise MeshProfileError("unsupported-motlist-capability")
+	if import_profile["motion"]["family"] != "legacy":
+		raise MeshProfileError("unsupported-motion-import-family")
+	runtime.dialogOptions.motDialog = None
+	motlist = runtime.motlistFile(data, path)
+	dialog = runtime.openOptionsDialogImportWindow(None, None, {"motlist": motlist, "isMotlist": True})
+	dialog.createMotlistWindow()
+	model = runtime.NoeModel()
+	if not dialog.isCancelled:
+		attachSelectedAnimations(runtime, model, dialog, dialog.pak.bones, "standalone")
+	return model
 
 
 def bind(runtime):
@@ -229,7 +415,7 @@ def bind(runtime):
 	class PragmataMotlistSelectionSource:
 		# Contract consumed by the shared animation selection window.
 		gameName = "PRAGMATA"
-		fileSuffix = ".motlist.1057"
+		fileSuffix = formats["PRAGMATA"]["import"]["motion"]["file_suffix"]
 
 		def __init__(self, decoded, path):
 			self.decoded = decoded
