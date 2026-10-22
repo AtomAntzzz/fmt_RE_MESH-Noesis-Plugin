@@ -147,7 +147,7 @@ def registerNoesisTypes():
 		noesis.addOption(handle, "-vfx", "Export as VFX mesh", 0)
 		return handle
 
-	handle = noesis.register("RE Engine MESH [PC]", ".1902042334;.1808312334;.1808282334;.2008058288;.2102020001;.2101050001;.2109108288;.2109148288;.220128762;.220301866;.220721329;.221108797;.220907984;.230110883;.230612127;.231011879;.240424828;.251121828;.NewMesh")
+	handle = noesis.register("RE Engine MESH [PC]", ".1902042334;.1808312334;.1808282334;.2008058288;.2102020001;.2101050001;.2109108288;.2109148288;.220128762;.220301866;.220721329;.221108797;.220907984;.230110883;.230612127;.231011879;.240424828;.251121828;.241111606;.NewMesh")
 	noesis.setHandlerTypeCheck(handle, meshCheckType)
 	noesis.setHandlerLoadModel(handle, meshLoadModel)
 	noesis.addOption(handle, "-noprompt", "Do not prompt for MDF file", 0)
@@ -163,7 +163,7 @@ def registerNoesisTypes():
 			noesis.OPTFLAG_WANTARG)
 		noesis.addOption(handle, "-noprompt", "Do not show source prompts", 0)
 
-	handle = noesis.register("RE Engine Texture [PC]", ".10;.190820018;.11;.8;.28;.stm;.30;.31;.34;.35;.36;.40;.143221013;.143230113;.719230324;.760230703;.240606151;.251111100")
+	handle = noesis.register("RE Engine Texture [PC]", ".10;.190820018;.11;.8;.28;.stm;.30;.31;.34;.35;.36;.40;.143221013;.143230113;.719230324;.760230703;.240606151;.251111100;.241106027")
 	noesis.setHandlerTypeCheck(handle, texCheckType)
 	noesis.setHandlerLoadRGBA(handle, texLoadDDS)
 
@@ -370,6 +370,7 @@ from re_engine_gdeflate import bind as _bind_re_engine_gdeflate
 from re_engine_tex import bind as _bind_re_engine_tex
 (
 	parsePragmataTexProfile,
+	parseWildsTexProfile,
 	decodePragmataTexMips,
 	preparePragmataTexSurface,
 	texCheckType,
@@ -422,6 +423,11 @@ from re_engine_mesh_profiles import (
 	decodePragmataBlendHalfDelta,
 	_pragmataNeutralBlendValue,
 	_decodePragmataBlendShapes,
+	detectWildsMeshIdentity,
+	parseWildsMeshHeader,
+	parseWildsMeshData,
+	parseWildsMplyHeader,
+	parseWildsMplyData,
 	parsePragmataHeader,
 	parsePragmataMplyHeader,
 	_meshFloat32,
@@ -479,7 +485,9 @@ from re_engine_animation import bind as _bind_re_engine_animation
 	_printPragmataMotlistStats,
 	PragmataMotlistSelectionMotion,
 	PragmataMotlistSelectionSource,
+	WildsMotlistSelectionSource,
 	buildPragmataMotlist1057MultiModel,
+	buildWildsMotlist992Model,
 	getGlobalMatrix,
 	getChildBones,
 	cleanBoneName,

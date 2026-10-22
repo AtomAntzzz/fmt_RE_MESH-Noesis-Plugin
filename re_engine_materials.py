@@ -2,9 +2,14 @@
 
 import re_engine_common as re_common
 import struct
+import math
 from re_engine_types import _materialCheckedRange, _materialScalar
 import re_engine_tex as texture_import
-from re_engine_paths import resolveMaterialCompanionPath, resolveTextureResourcePath
+from re_engine_paths import (
+	resolveMaterialCompanionPath, resolveTextureResourcePath, findMaterialCompanionPath,
+	findLinkedMaterialPath,
+	_materialNativesRoot,
+)
 from re_engine_config import (
 	MDF2_51_EXACT_TEXTURE_COUNT,
 	MDF2_51_EXACT_PROPERTY_COUNT,
@@ -36,6 +41,59 @@ def _materialUtf16z(data, offset, limit, label):
 	return re_common.read_utf16z(
 		data, offset, limit, label, MaterialProfileError)
 
+def validateWildsMdfProfile(data, path):
+	"""Bound the observed MDF45 records before using the legacy material builder."""
+	if not path.lower().endswith(".mdf2.45"):
+		raise MaterialProfileError("mdf2-suffix-mismatch")
+	_materialCheckedRange(data, 0, 16, "mdf2-header")
+	if data[:4] != b"MDF\0":
+		raise MaterialProfileError("mdf2-magic-mismatch")
+	version, count = struct.unpack_from("<HH", data, 4)
+	if version != 1 or not count:
+		raise MaterialProfileError("mdf2-version-or-count-mismatch")
+	entries_end = 16 + count * 100
+	_materialCheckedRange(data, 16, count * 100, "material-entries")
+	ranges = [(0, entries_end)]
+	strings = set()
+	def region(offset, size, label):
+		value = _materialCheckedRange(data, offset, size, label)
+		if size and any(re_common.ranges_overlap(value, old) for old in ranges):
+			raise MaterialProfileError("range-overlap:" + label)
+		if size:
+			ranges.append(value)
+	def string(offset, label):
+		value = _materialUtf16z(data, offset, len(data), label)
+		if not value:
+			raise MaterialProfileError("empty-string:" + label)
+		if offset not in strings:
+			region(offset, len(value.encode("utf-16-le")) + 2, label)
+			strings.add(offset)
+		return value
+	for i in range(count):
+		entry = 16 + i * 100
+		string(_materialScalar(data, entry, "<Q", "material-name"), "material-name")
+		size, props, textures = struct.unpack_from("<III", data, entry + 12)
+		prop_table, tex_table, unused, values, master, unused2 = struct.unpack_from("<6Q", data, entry + 52)
+		string(master, "master-material")
+		region(prop_table, props * 24, "property-table")
+		region(tex_table, textures * 32, "texture-table")
+		region(values, size, "property-data")
+		for index in range(props):
+			name, unused_hash, offset, number = struct.unpack_from("<QQII", data, prop_table + index * 24)
+			string(name, "property-name")
+			if not number or offset % 4 or offset + number * 4 > size:
+				raise MaterialProfileError("property-data-out-of-bounds")
+			floats = struct.unpack_from("<" + str(number) + "f", data, values + offset)
+			if any(not math.isfinite(value) for value in floats):
+				raise MaterialProfileError("non-finite-material-property")
+		for index in range(textures):
+			slot, unused_hash, resource, unused_flags = struct.unpack_from("<4Q", data, tex_table + index * 32)
+			string(slot, "texture-slot")
+			resource = string(resource, "texture-path").replace("@", "").replace("\\", "/")
+			if (":" in resource or not resource.endswith(".tex") or
+					any(part in ("", ".", "..") for part in resource.split("/"))):
+				raise MaterialProfileError("texture-resource-path-mismatch")
+
 def parsePragmataMdf2Profile(data, path):
 	if not path.lower().endswith(formats["PRAGMATA"]["mdfExt"]):
 		raise MaterialProfileError("mdf2-suffix-mismatch")
@@ -60,23 +118,22 @@ def parsePragmataMdf2Profile(data, path):
 			"property_data_size": _materialScalar(data, entry_offset + 0x0C, "<I", "property-data-size"),
 			"property_count": _materialScalar(data, entry_offset + 0x10, "<I", "property-count"),
 			"texture_count": _materialScalar(data, entry_offset + 0x14, "<I", "texture-count"),
+			"gpu_name_count": _materialScalar(data, entry_offset + 0x18, "<I", "gpu-name-count"),
+			"gpu_path_count": _materialScalar(data, entry_offset + 0x1C, "<I", "gpu-path-count"),
 			"shader_type": _materialScalar(data, entry_offset + 0x20, "<I", "shader-type"),
 			"alpha_flags_raw": _materialScalar(data, entry_offset + 0x28, "<I", "alpha-flags"),
 			"property_table_offset": _materialScalar(data, entry_offset + 0x3C, "<Q", "property-table"),
 			"texture_table_offset": _materialScalar(data, entry_offset + 0x44, "<Q", "texture-table"),
-			"first_material_name_offset": _materialScalar(data, entry_offset + 0x4C, "<Q", "first-material-name"),
+			"gpu_buffer_offset": _materialScalar(data, entry_offset + 0x4C, "<Q", "gpu-buffer-table"),
 			"property_data_offset": _materialScalar(data, entry_offset + 0x54, "<Q", "property-data"),
 			"master_material_offset": _materialScalar(data, entry_offset + 0x5C, "<Q", "master-material"),
 			"trailing_raw": _materialScalar(data, entry_offset + 0x64, "<Q", "material-trailing"),
 		})
 	if material_count > 1 and entries[0]["texture_table_offset"] == 0x7C:
 		raise MaterialProfileError("material-count-mismatch")
-	if material_count == 1:
-		if entries[0]["texture_count"] != MDF2_51_EXACT_TEXTURE_COUNT:
-			raise MaterialProfileError("texture-count-mismatch")
-		if entries[0]["property_count"] != MDF2_51_EXACT_PROPERTY_COUNT:
-			raise MaterialProfileError("property-count-mismatch")
-		_materialCheckedRange(data, entries[0]["texture_table_offset"], entries[0]["texture_count"] * MDF2_51_TEXTURE_ENTRY_SIZE, "texture-table")
+	# Cardinalities belong to each material, including single-material files.
+	# Check the first table before its chain to retain useful truncation errors.
+	_materialCheckedRange(data, entries[0]["texture_table_offset"], entries[0]["texture_count"] * MDF2_51_TEXTURE_ENTRY_SIZE, "texture-table")
 	expected_offset = entries_end
 	for entry in entries:
 		if entry["texture_table_offset"] != expected_offset:
@@ -88,10 +145,20 @@ def parsePragmataMdf2Profile(data, path):
 			raise MaterialProfileError("property-table-chain-mismatch")
 		_materialCheckedRange(data, expected_offset, entry["property_count"] * MDF2_51_PROPERTY_ENTRY_SIZE, "property-table")
 		expected_offset += entry["property_count"] * MDF2_51_PROPERTY_ENTRY_SIZE
-	string_start = expected_offset
+	# The optional GPBF block follows the property tables. Each binding has
+	# two 16-byte records (UTF-16 pointer + opaque hash), name then resource.
+	# Empty materials retain the block start; populated materials own consecutive
+	# nonoverlapping slices. This is separate from the following string region.
+	gpu_start = expected_offset
 	for entry in entries:
-		if entry["first_material_name_offset"] != string_start:
-			raise MaterialProfileError("first-material-name-mismatch")
+		if entry["gpu_name_count"] != entry["gpu_path_count"]:
+			raise MaterialProfileError("gpu-buffer-count-mismatch")
+		count = entry["gpu_name_count"]
+		if entry["gpu_buffer_offset"] != (expected_offset if count else gpu_start):
+			raise MaterialProfileError("gpu-buffer-table-chain-mismatch")
+		_materialCheckedRange(data, expected_offset, count * 32, "gpu-buffer-table")
+		expected_offset += count * 32
+	string_start = expected_offset
 	for material_index in range(material_count - 1):
 		entry = entries[material_index]
 		if entry["property_data_offset"] + entry["property_data_size"] != entries[material_index + 1]["property_data_offset"]:
@@ -102,26 +169,39 @@ def parsePragmataMdf2Profile(data, path):
 	string_limit = entries[0]["property_data_offset"]
 	if string_limit < string_start:
 		raise MaterialProfileError("string-region-overlap")
+	def materialString(offset, label):
+		if offset < string_start:
+			raise MaterialProfileError(label + "-string-region-overlap")
+		return _materialUtf16z(data, offset, string_limit, label)
 	materials = []
 	seen_names = {}
 	for entry in entries:
 		_materialCheckedRange(data, entry["property_data_offset"], entry["property_data_size"], "property-data")
-		material_name = _materialUtf16z(data, entry["name_offset"], string_limit, "material-name")
+		material_name = materialString(entry["name_offset"], "material-name")
 		if material_name in seen_names:
 			raise MaterialProfileError("duplicate-material-name")
 		seen_names[material_name] = True
+		gpu_buffers = []
+		for index in range(entry["gpu_name_count"]):
+			name_offset, name_hash, path_offset, path_hash = struct.unpack_from(
+				"<QQQQ", data, entry["gpu_buffer_offset"] + index * 32)
+			gpu_buffers.append({
+				"name": materialString(name_offset, "gpu-buffer-name"),
+				"path": materialString(path_offset, "gpu-buffer-path"),
+				"name_hash": name_hash, "path_hash": path_hash,
+			})
 		textures = []
 		for texture_index in range(entry["texture_count"]):
 			row_offset = entry["texture_table_offset"] + texture_index * MDF2_51_TEXTURE_ENTRY_SIZE
 			slot_offset, texture_hash, texture_path_offset, reserved = struct.unpack_from("<QQQQ", data, row_offset)
 			if reserved != 0:
 				raise MaterialProfileError("texture-reserved-mismatch")
-			slot = _materialUtf16z(data, slot_offset, string_limit, "texture-slot")
+			slot = materialString(slot_offset, "texture-slot")
 			semantic, confidence, preview_use = PRAGMATA_TEXTURE_SEMANTICS.get(slot, ("raw", "unverified", "raw-only"))
 			textures.append({
 				"index": texture_index,
 				"slot": slot,
-				"path": _materialUtf16z(data, texture_path_offset, string_limit, "texture-path"),
+				"path": materialString(texture_path_offset, "texture-path"),
 				"hash": texture_hash,
 				"semantic": semantic,
 				"confidence": confidence,
@@ -134,12 +214,15 @@ def parsePragmataMdf2Profile(data, path):
 			value_size = value_count * 4
 			if value_count < 1 or value_offset + value_size > entry["property_data_size"]:
 				raise MaterialProfileError("property-value-out-of-bounds")
+			values = struct.unpack_from("<" + "f" * value_count, data, entry["property_data_offset"] + value_offset)
+			if any(not math.isfinite(value) for value in values):
+				raise MaterialProfileError("non-finite-material-property")
 			properties.append({
 				"index": property_index,
-				"name": _materialUtf16z(data, name_offset, string_limit, "property-name"),
+				"name": materialString(name_offset, "property-name"),
 				"hash": name_hash,
 				"value_offset": value_offset,
-				"values": struct.unpack_from("<" + "f" * value_count, data, entry["property_data_offset"] + value_offset),
+				"values": values,
 			})
 		materials.append({
 			"index": entry["index"],
@@ -147,7 +230,8 @@ def parsePragmataMdf2Profile(data, path):
 			"hash": entry["hash"],
 			"shader_type": entry["shader_type"],
 			"alpha_flags_raw": entry["alpha_flags_raw"],
-			"master_material": _materialUtf16z(data, entry["master_material_offset"], string_limit, "master-material"),
+			"master_material": materialString(entry["master_material_offset"], "master-material"),
+			"gpu_buffers": gpu_buffers,
 			"textures": textures,
 			"properties": properties,
 			"layout": entry,
@@ -161,10 +245,6 @@ def parsePragmataMdf2Profile(data, path):
 	}
 	if material_count == 1:
 		material = materials[0]
-		if len(material["textures"]) != MDF2_51_EXACT_TEXTURE_COUNT:
-			raise MaterialProfileError("texture-count-mismatch")
-		if len(material["properties"]) != MDF2_51_EXACT_PROPERTY_COUNT:
-			raise MaterialProfileError("property-count-mismatch")
 		legacy_textures = []
 		for texture in material["textures"]:
 			legacy_textures.append({
@@ -179,8 +259,6 @@ def parsePragmataMdf2Profile(data, path):
 				if target_texture is not None:
 					raise MaterialProfileError("target-texture-duplicate")
 				target_texture = texture
-		if target_texture is None:
-			raise MaterialProfileError("target-texture-missing")
 		result.update({
 			"material_name": material["name"],
 			"material_hash": material["hash"],
@@ -188,9 +266,10 @@ def parsePragmataMdf2Profile(data, path):
 			"alpha_flags_raw": material["alpha_flags_raw"],
 			"master_material": material["master_material"],
 			"textures": legacy_textures,
-			"target_texture": target_texture,
 			"properties": material["properties"],
 		})
+		if target_texture is not None:
+			result["target_texture"] = target_texture
 	return result
 
 def bindPragmataMaterialRecords(meshNames, materials):
@@ -286,7 +365,7 @@ MESH_RUNTIME_DEPENDENCIES = (
 	'bPrintFileList',
 	'bPrintMDF',
 	'bindPragmataMaterialRecords',
-	'buildNoesisMaterial',
+	'LoadExtractedDir',
 	'dialogOptions',
 	'extractedNativesPath',
 	'generateDummyTexture4px',
@@ -382,18 +461,78 @@ def readLegacyMaterialTexture(bs, version, entry, index, read_string):
 	return {"slot": slot, "path": path, "hash": row[1]}
 
 
+def selectMaterialTextureSlots(textures):
+	"""Choose primary maps by MDF semantics before using filename hints.
+
+	A missing primary resource stays missing; detail/blend/environment maps
+	are not replacements for the surface's base color or tangent normal.
+	"""
+	primary = (
+		("BaseDielectricMap", "BaseMetalMap", "BaseAlphaMap", "BaseShiftMap",
+		 "BaseAnisoShiftMap", "BaseMap", "BaseDielectricMapBase",
+		 "FaceBaseMap", "Face_BaseDielectricMap", "IrisBaseMap", "ScleraMap"),
+		("NormalRoughnessMap", "NormalRoughnessCavityMap",
+		 "NormalRoughnessTranslucentMap", "NRMR_NRRTMap", "NormalMap"),
+	)
+	result = []
+	for slots, hint in zip(primary, ("_alb", "_nr")):
+		explicit = [i for i, texture in enumerate(textures) if texture["slot"] in slots]
+		if explicit:
+			result.append(explicit[0])
+			continue
+		fallback = [i for i, texture in enumerate(textures)
+			if hint in texture["path"].lower() and not any(word in texture["slot"].lower()
+				for word in ("detail", "damage", "blend", "panorama", "ripple", "skin", "hair", "mask", "wrinkle"))]
+		result.append(fallback[0] if fallback else None)
+	return tuple(result)
+
+
 def loadMeshMaterials(mesh, material_names=None, material_count=None):
 	"""Select only the material component; its commit/error policy stays local."""
 	family = mesh.importProfile["material"]["family"]
+	if family == "mdf-45-legacy":
+		return mesh.createMaterials(material_count if material_count is not None else len(material_names),
+			materialNames=material_names)
 	if family == "legacy":
 		return mesh.createMaterials(material_count if material_count is not None else len(material_names))
 	if family == "mdf-51-observed":
-		return mesh._loadPragmataMaterialProfile(material_names if material_names is not None else mesh.matNames)
+		names = material_names if material_names is not None else mesh.matNames
+		return mesh.createMaterials(len(names), materialNames=names)
 	raise MaterialProfileError("unsupported-material-import-family")
 
 
 def bind_mesh_materials(runtime):
-	def createMaterials(self, matCount):
+	def createMaterials(self, matCount, materialNames=None, decoder=None):
+		# MDF51 keeps its validated records and transactional publication, but
+		# uses the same lookup, texture conversion and Noesis builder as legacy.
+		profile = getattr(self, "importProfile", None)
+		if profile is None or profile["material"]["family"] != "mdf-51-observed":
+			return _createMaterials(self, matCount, materialNames, decoder)
+		staged = copy.copy(self)
+		listFields = ("matList", "texList", "fullMatList", "fullTexList", "matNames",
+			"matHashes", "texNames", "missingTexNames", "texColors")
+		for field in listFields:
+			setattr(staged, field, list(getattr(self, field, [])))
+		staged.uvBias = dict(getattr(self, "uvBias", {}))
+		try:
+			staged.rootDir = _materialNativesRoot(self.path, profile["format"])[1]
+			if hasattr(self, "gameName"):
+				runtime.extractedNativesPath = runtime.LoadExtractedDir(self.gameName)
+			result = _createMaterials(staged, matCount, materialNames, decoder)
+		except MaterialProfileError as error:
+			print("RE_MATERIAL_PROFILE_ERROR:" + str(error))
+			return False
+		if result:
+			for field in listFields:
+				if hasattr(self, field):
+					getattr(self, field)[:] = getattr(staged, field)
+				else:
+					setattr(self, field, getattr(staged, field))
+			self.uvBias = staged.uvBias
+			self.materialProfile = staged.materialProfile
+		return result
+
+	def _createMaterials(self, matCount, materialNames=None, decoder=None):
 		# Shared state is owned by runtime.
 
 		doColorize = runtime.bColorize
@@ -411,6 +550,7 @@ def bind_mesh_materials(runtime):
 		mmtrExt = metadata["mmtrExt"]
 		nDir = metadata["nDir"]
 		mdfExt = metadata["mdfExt"]
+		strictRecords = material_rules["family"] == "mdf-51-observed"
 
 		if runtime.extractedNativesPath != "":
 			print ("Using this extracted natives path:", runtime.extractedNativesPath + "\n")
@@ -446,7 +586,11 @@ def bind_mesh_materials(runtime):
 
 		similarityCounter = 0
 		ogFileName = runtime.rapi.getLocalFileName(inputName)
-		if not runtime.rapi.checkFileExists(pathPrefix + mdfExt):
+		companion = findMaterialCompanionPath(
+			pathPrefix + ".mesh" + modelExt, metadata, runtime.rapi.checkFileExists)
+		if companion is not None:
+			pathPrefix = companion[:-len(mdfExt)]
+		if material_rules["family"] == "legacy" and not runtime.rapi.checkFileExists(pathPrefix + mdfExt):
 			for item in os.listdir(os.path.dirname(pathPrefix + mdfExt)):
 				if mdfExt == (".mdf2" + os.path.splitext(item)[1]):
 					test = runtime.rapi.getLocalFileName(os.path.join(os.path.dirname(pathPrefix), item)).replace(mdfExt, "")
@@ -465,17 +609,26 @@ def bind_mesh_materials(runtime):
 		if not (runtime.rapi.checkFileExists(materialFileName)):
 			materialFileName = (pathPrefix + "_00" + mdfExt)
 		if not (runtime.rapi.checkFileExists(materialFileName)):
-			if self.mdfVer >= 2: #sGameName == "RERT" or sGameName == "RE3" or sGameName == "ReVerse" or sGameName == "RE8" or sGameName == "MHRise":
-				pathPrefix = runtime.extractedNativesPath + re.sub(r'.*stm\\', '', inputName)
-			else:
-				pathPrefix = runtime.extractedNativesPath + re.sub(r'.*x64\\', '', inputName)
-			pathPrefix = pathPrefix.replace(modelExt,"").replace(".mesh","")
-			materialFileName = (pathPrefix + mdfExt)
-			print (materialFileName)
-			if not (runtime.rapi.checkFileExists(materialFileName)):
-				materialFileName = (pathPrefix + "_mat" + mdfExt)
-			if not (runtime.rapi.checkFileExists(materialFileName)):
-				materialFileName = (pathPrefix + "_00" + mdfExt)
+			companion = findMaterialCompanionPath(
+				inputName, metadata, runtime.rapi.checkFileExists,
+				[runtime.extractedNativesPath])
+			if companion is not None:
+				materialFileName = companion
+		if not runtime.rapi.checkFileExists(materialFileName):
+			try:
+				linked = findLinkedMaterialPath(inputName, metadata, [runtime.extractedNativesPath])
+			except MaterialProfileError as error:
+				print("RE_MATERIAL_PROFILE_ERROR:" + str(error))
+				return False
+			if linked is not None:
+				materialFileName = linked
+
+		if material_rules["family"] in ("mdf-45-legacy", "mdf-51-observed") and (
+				runtime.noesis.optWasInvoked("-b") or runtime.noesis.optWasInvoked("-noprompt")):
+			if not runtime.rapi.checkFileExists(materialFileName):
+				print("No material file.")
+				return False
+			skipPrompt = 2
 
 		if not (runtime.rapi.checkFileExists(materialFileName)):
 			materialFileName = runtime.noesis.userPrompt(runtime.noesis.NOEUSERVAL_FILEPATH, "MDF File Not Found", "Manually enter the name of the MDF file or cancel.", os.path.join(os.path.dirname(inputName), runtime.rapi.getLocalFileName(materialFileName)) , None)
@@ -527,10 +680,31 @@ def bind_mesh_materials(runtime):
 		texFresnelColour = []
 
 		bs = runtime.rapi.loadIntoByteArray(materialFileName)
-		bs = runtime.NoeBitStream(bs)
-		#Magic, Unknown, MaterialCount, Unknown, Unknown
-		matHeader = [bs.readUInt(), bs.readUShort(), bs.readUShort(), bs.readUInt(), bs.readUInt()]
-		matCountMDF = matHeader[2]
+		profile = None
+		if strictRecords:
+			profile = runtime.parsePragmataMdf2Profile(bs, materialFileName)
+			records = runtime.bindPragmataMaterialRecords(materialNames, profile["materials"])
+			# Validate all referenced paths, including textures not selected for
+			# basic preview, before publishing or loading external resources.
+			for record in records:
+				for texture in record["textures"]:
+					resolveTextureResourcePath(self.path, texture["path"], metadata)
+			profile["bound_material_names"] = [record["name"] for record in records]
+			self.materialProfile = profile
+		if material_rules["family"] == "mdf-45-legacy":
+			validateWildsMdfProfile(bs, materialFileName)
+		if strictRecords:
+			matCountMDF = len(records)
+		else:
+			bs = runtime.NoeBitStream(bs)
+			#Magic, Unknown, MaterialCount, Unknown, Unknown
+			matHeader = [bs.readUInt(), bs.readUShort(), bs.readUShort(), bs.readUInt(), bs.readUInt()]
+			matCountMDF = matHeader[2]
+			if material_rules["family"] == "mdf-45-legacy" and materialNames is not None:
+				mdfNames = [readLegacyMaterialEntry(bs, self.mdfVer, index,
+					runtime.ReadUnicodeString)["name"] for index in range(matCountMDF)]
+				if len(set(mdfNames)) != len(mdfNames) or set(mdfNames) != set(materialNames):
+					raise MaterialProfileError("mesh-material-names-mismatch")
 
 		if matCountMDF != matCount and len(self.fullMatList) == 0:
 			print ("MDF Checkerboard Error: MDF does not have the same material count as the MESH file!\n	MESH materials:", matCount, "\n	MDF Materials:", matCountMDF)
@@ -538,18 +712,28 @@ def bind_mesh_materials(runtime):
 
 		usedMats = [mat.name for mat in self.fullMatList]
 		usedTexs = [tex.name for tex in self.fullTexList]
+		textureBindings = {}
 
 		#Parse Materials
 		for i in range(matCountMDF):
 
-			record = readLegacyMaterialEntry(bs, self.mdfVer, i, runtime.ReadUnicodeString)
+			record = records[i] if strictRecords else readLegacyMaterialEntry(bs, self.mdfVer, i, runtime.ReadUnicodeString)
 			materialName = record["name"]
 			materialHash = record["hash"]
 			mmtrName = record["master_material"]
-			floatCount = record["property_count"]
-			texCount = record["texture_count"]
+			floatCount = len(record["properties"]) if strictRecords else record["property_count"]
+			texCount = len(record["textures"]) if strictRecords else record["texture_count"]
+			textures = (record["textures"] if strictRecords else [
+				readLegacyMaterialTexture(bs, self.mdfVer, record, index, runtime.ReadUnicodeString)
+				for index in range(texCount)])
 			#hasTransparency = not not (((alphaFlag & ( 1 << 1 )) >> 1) or ((alphaFlag & ( 1 << 4 )) >> 4))
 			hasTransparency = "_dirt" in mmtrName or "_decal" in mmtrName or "_hair" in mmtrName
+			isEnvAlphaTest = mmtrName.replace("\\", "/").rsplit("/", 1)[-1].lower() == "env_alphatest.mmtr"
+			isMdfAlphaTest = (material_rules["family"] == "mdf-45-legacy" and
+				bool(record.get("alpha_flags_raw", 0) & 2) and
+				any("AlphaTranslucent" in texture["slot"] for texture in textures))
+			hasTransparency = hasTransparency or isEnvAlphaTest or isMdfAlphaTest
+			alphaTestRef = 0.05
 
 			if runtime.bPrintFileList:
 				self.texNames.append(("natives/" + nDir + "/" + mmtrName + mmtrExt).lower())
@@ -571,6 +755,8 @@ def bind_mesh_materials(runtime):
 			bFoundBM = False
 			bFoundNM = False
 			bFoundSSSM = False
+			bFoundEmissive = False
+			emissiveEnabled = True
 
 			bFoundBaseColour = False
 			bFoundRoughColour = False
@@ -583,7 +769,7 @@ def bind_mesh_materials(runtime):
 				print ("Material Properties:")
 
 			for j in range(floatCount): # floats
-				propertyRecord = readLegacyMaterialProperty(bs, self.mdfVer, record, j, runtime.ReadUnicodeString)
+				propertyRecord = record["properties"][j] if strictRecords else readLegacyMaterialProperty(bs, self.mdfVer, record, j, runtime.ReadUnicodeString)
 				paramType = propertyRecord["name"]
 				values = propertyRecord["values"]
 				colours = (runtime.NoeVec4(values) if len(values) == 4 else values[0]) if values is not None else None
@@ -611,6 +797,14 @@ def bind_mesh_materials(runtime):
 					texFresnelColour.append(colours)
 				if paramType == "Occlusion_UseSecondaryUV" and colours != 0:
 					materialFlags2 |= runtime.noesis.NMATFLAG2_OCCL_UV1
+				if paramType == "Emissive_Intensity" and colours == 0:
+					# A default white map is also used by explicitly disabled emission.
+					emissiveEnabled = False
+				if (((isEnvAlphaTest and paramType == "AlphaTestRef") or
+						(isMdfAlphaTest and paramType == "AlphaTest_Ref")) and
+						values is not None and len(values) == 1 and
+						0.0 <= values[0] <= 1.0):
+					alphaTestRef = values[0]
 
 			#Append defaults
 			if not bFoundBaseColour:
@@ -629,15 +823,26 @@ def bind_mesh_materials(runtime):
 			if doPrintMDF:
 				print ("\nTextures for " + materialName + "[" + str(i) + "]" + ":")
 
-			alreadyLoadedTexs = [tex.name for tex in self.fullTexList]
+			alreadyLoadedTexs = [tex.name for tex in self.fullTexList + self.texList]
 			alreadyLoadedMats = [mat.name for mat in self.fullMatList]
 			secondaryDiffuse = ""
+			useSlotSelection = material_rules["family"] == "mdf-45-legacy"
+			diffuseSlot, normalSlot = selectMaterialTextureSlots(textures) if useSlotSelection else (None, None)
+			if profile and profile.get("target_texture"):
+				diffuseSlot = next((index for index, texture in enumerate(textures)
+					if texture["slot"] == profile["target_texture"]["slot"]), diffuseSlot)
 
 			for j in range(texCount): # texture headers
 
-				textureRecord = readLegacyMaterialTexture(bs, self.mdfVer, record, j, runtime.ReadUnicodeString)
+				textureRecord = textures[j]
 				textureType = textureRecord["slot"]
 				textureName = textureRecord["path"]
+				# Preserve the frozen single-material diagnostic as a fallback;
+				# it is not a game shader or a general mask-to-albedo rule.
+				if profile and profile.get("target_texture", {}).get("slot") == textureType:
+					textureType = "BaseMap"
+				if material_rules["family"] == "mdf-45-legacy":
+					resolveTextureResourcePath(self.path, textureName, metadata)
 
 				textureFilePath = ""
 				texName = ""
@@ -703,8 +908,14 @@ def bind_mesh_materials(runtime):
 								self.texNames.append(newTexPath.replace('streaming/',''))
 
 				lowerTexName = texName.lower()
+				if not runtime.rapi.checkFileExists(textureFilePath) and not textureName.endswith("rtex"):
+					print("Error: Texture at path: " + str(textureFilePath) + " does not exist!")
+					if profile and profile.get("target_texture", {}).get("slot") == textureRecord["slot"]:
+						raise MaterialProfileError("tex-companion-missing")
+					continue
 				#if (("BaseMetal" in textureType or "BaseDielectric" in textureType or "BaseAlpha" in textureType or "BaseShift" in textureType)) and not bFoundBM: #
-				if "_alb" in lowerTexName and (not bFoundBM or ("_albd" in lowerTexName)): #goddamn RE8 #"_albm" in lowerTexName or
+				if ((useSlotSelection and j == diffuseSlot) or (not useSlotSelection and
+						"_alb" in lowerTexName and (not bFoundBM or "_albd" in lowerTexName))):
 					bFoundBM = True
 					material.setTexture(texName)
 					material.setSpecularColor([.25, .25, .25, 1])
@@ -716,7 +927,8 @@ def bind_mesh_materials(runtime):
 						extraParam = "isALBD"
 					self.uvBias[material.name] = [0.5, 0.5] if material_rules["atlas_uv"] and "atlas" in lowerTexName else 1.0
 				#elif (("Normal" in textureType or "NR" in textureType) or "_nr" in lowerTexName) and not bFoundNM:
-				elif "_nr" in lowerTexName and not bFoundNM:
+				elif not bFoundNM and ((useSlotSelection and j == normalSlot) or
+						(not useSlotSelection and "_nr" in lowerTexName)):
 					bFoundNM = True
 					material.setNormalTexture(texName)
 					extraParam = "isNRM"
@@ -733,12 +945,23 @@ def bind_mesh_materials(runtime):
 					opacityName = texName
 				#elif "_lymo" in lowerTexName:
 				#	extraParam = "isLYMO"
-				elif re.search("^Base.*Map$", textureType) and not secondaryDiffuse:
+				elif textureType == "EmissiveMap" and emissiveEnabled and not bFoundEmissive:
+					emissivePass = runtime.NoeMaterial(materialName + "_emissive", texName)
+					emissivePass.setBlendMode("GL_ONE", "GL_ONE")
+					emissivePass.setFlags(runtime.noesis.NMATFLAG_BASICBLEND)
+					material.setNextPass(emissivePass)
+					bFoundEmissive = True
+				elif not useSlotSelection and (re.search("^Base.*Map$", textureType) or textureType in ("IrisBaseMap", "ScleraMap")) and not secondaryDiffuse:
 				#elif ("_alb" in lowerTexName) and not secondaryDiffuse:
 					secondaryDiffuse = texName
 				elif not runtime.dialogOptions.loadAllTextures:
 					isNotMainTexture = True
 
+				bindingKey = (texName, extraParam)
+				if bAlreadyLoadedTexture and bindingKey not in textureBindings:
+					# An earlier import/other interpretation has no reusable conversion
+					# recipe here. Re-read rather than omit this material's bindings.
+					bAlreadyLoadedTexture = False
 				if not bAlreadyLoadedTexture and not isNotMainTexture:
 					if (textureName.endswith("rtex")):
 						pass
@@ -748,13 +971,18 @@ def bind_mesh_materials(runtime):
 					else:
 						textureData = runtime.rapi.loadIntoByteArray(textureFilePath)
 						numTex = len(self.texList)
-						noetex = texture_import.loadTextureForImport(runtime, textureData, self.texList, texName, textureFilePath, import_profile["texture"])
+						noetex = texture_import.loadTextureForImport(runtime, textureData, self.texList, texName, textureFilePath, import_profile["texture"], decoder)
 						if noetex:
+							bindingCalls = []
+							conversionFlags = 0
+							def bindConverted(method, *args):
+								bindingCalls.append((method, args))
+								getattr(material, method)(*args)
 							if runtime.dialogOptions.doConvertTex:
 								if "isALBM"  == extraParam or "isALBD" == extraParam:
 									if "isALBD" == extraParam:
 										noetex.pixelData = runtime.invertRawRGBAChannel(noetex.pixelData, 3)
-									materialFlags |= runtime.noesis.NMATFLAG_PBR_METAL
+									conversionFlags |= runtime.noesis.NMATFLAG_PBR_METAL
 									if runtime.dialogOptions.doConvertMatsForBlender:
 										metalTexData = runtime.rapi.imageEncodeRaw(noetex.pixelData, noetex.width, noetex.height, "a8a8a8")
 										metalTexData = runtime.rapi.imageDecodeRaw(metalTexData, noetex.width, noetex.height, "r8g8b8")
@@ -762,18 +990,18 @@ def bind_mesh_materials(runtime):
 										noetex.pixelData = runtime.rapi.imageDecodeRaw(noetex.pixelData, noetex.width, noetex.height, "r8g8b8")
 										if not runtime.isImageBlank(metalTexData, noetex.width, noetex.height, 4):
 											metalTexName = texName.replace(runtime.texOutputExt,  "_NoesisMET" + runtime.texOutputExt)
-											material.setSpecularTexture(metalTexName)
+											bindConverted("setSpecularTexture", metalTexName)
 											self.texList.append(runtime.NoeTexture(metalTexName, noetex.width, noetex.height, metalTexData, runtime.noesis.NOESISTEX_RGBA32))
 									else:
-										material.setSpecularTexture(texName)
-										material.setSpecularSwizzle( runtime.NoeMat44([[1, 0, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0], [0, 1, 0, 0]])) #move alpha channel to green channel
+										bindConverted("setSpecularTexture", texName)
+										bindConverted("setSpecularSwizzle",  runtime.NoeMat44([[1, 0, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0], [0, 1, 0, 0]])) #move alpha channel to green channel
 								if runtime.dialogOptions.doConvertMatsForBlender and ("isNRM" == extraParam or "isNRR" in extraParam):
 									roughnessTexData = runtime.rapi.imageEncodeRaw(noetex.pixelData, noetex.width, noetex.height, "a8a8a8" if "isNRM" == extraParam else "r8r8r8")
 									roughnessTexData = runtime.rapi.imageDecodeRaw(roughnessTexData, noetex.width, noetex.height, "r8g8b8")
 									if not runtime.isImageBlank(roughnessTexData, noetex.width, noetex.height, 4):
 										roughnessTexName = texName.replace(runtime.texOutputExt,  "_NoesisRGH" + runtime.texOutputExt)
 										self.texList.append(runtime.NoeTexture(roughnessTexName, noetex.width, noetex.height, roughnessTexData, runtime.noesis.NOESISTEX_RGBA32))
-										material.setBumpTexture(roughnessTexName)
+										bindConverted("setBumpTexture", roughnessTexName)
 								if "isNRR" in extraParam:
 									noetex.pixelData = runtime.rapi.imageSwapChannelRGBA32(noetex.pixelData, 3, 0)
 									#noetex.pixelData = rapi.imageNormalSwizzle(noetex.pixelData, noetex.width, noetex.height, 1, 0, 0)
@@ -787,21 +1015,21 @@ def bind_mesh_materials(runtime):
 									self.texList.append(runtime.NoeTexture(opacityName, noetex.width, noetex.height, opacityTexData, runtime.noesis.NOESISTEX_RGBA32))
 								if "isLYMO" == extraParam:
 									#r=metal? g= b=roughness? a=ao?
-									materialFlags |= runtime.noesis.NMATFLAG_PBR_METAL
+									conversionFlags |= runtime.noesis.NMATFLAG_PBR_METAL
 									metalTexName = texName.replace(runtime.texOutputExt,  "_NoesisMET" + runtime.texOutputExt)
 									metalTexData = runtime.rapi.imageEncodeRaw(noetex.pixelData, noetex.width, noetex.height, "r8r8r8")
 									metalTexData = runtime.rapi.imageDecodeRaw(metalTexData, noetex.width, noetex.height, "r8g8b8")
-									material.setSpecularTexture(metalTexName)
+									bindConverted("setSpecularTexture", metalTexName)
 									self.texList.append(runtime.NoeTexture(metalTexName, noetex.width, noetex.height, metalTexData, runtime.noesis.NOESISTEX_RGBA32))
 									if runtime.dialogOptions.doConvertMatsForBlender:
 										roughnessTexName = texName.replace(runtime.texOutputExt,  "_NoesisRGH" + runtime.texOutputExt)
 										roughnessTexData = runtime.rapi.imageEncodeRaw(noetex.pixelData, noetex.width, noetex.height, "b8b8b8")
 										roughnessTexData = runtime.rapi.imageDecodeRaw(roughnessTexData, noetex.width, noetex.height, "r8g8b8")
 										self.texList.append(runtime.NoeTexture(roughnessTexName, noetex.width, noetex.height, roughnessTexData, runtime.noesis.NOESISTEX_RGBA32))
-										material.setBumpTexture(roughnessTexName)
+										bindConverted("setBumpTexture", roughnessTexName)
 									noetex.pixelData = runtime.rapi.imageEncodeRaw(noetex.pixelData, noetex.width, noetex.height, "a8a8a8")
 									noetex.pixelData = runtime.rapi.imageDecodeRaw(noetex.pixelData, noetex.width, noetex.height, "r8g8b8")
-									material.setOcclTexture(noetex.name)
+									bindConverted("setOcclTexture", noetex.name)
 
 								if "isATOS" in extraParam:
 									imgData = copy.copy(noetex.pixelData)
@@ -812,20 +1040,32 @@ def bind_mesh_materials(runtime):
 										self.texList[len(self.texList)-1].pixelData = aoTexData
 									else:
 										self.texList.remove(noetex)
-										material.setOcclTexture("")
+										bindConverted("setOcclTexture", "")
 									if extraParam == "isATOS_Alpha" and not opacityName:
 										opacityTexData = runtime.rapi.imageEncodeRaw(imgData, noetex.width, noetex.height, "r8r8r8")
 										opacityTexData = runtime.rapi.imageDecodeRaw(opacityTexData, noetex.width, noetex.height, "r8g8b8")
 										if not runtime.isImageBlank(opacityTexData, noetex.width, noetex.height):
 											opacityName = texName.replace(runtime.texOutputExt,  "_NoesisAlpha" + runtime.texOutputExt)
-											materialFlags |= runtime.noesis.NMATFLAG_TWOSIDED
 											self.texList.append(runtime.NoeTexture(opacityName, noetex.width, noetex.height, opacityTexData, runtime.noesis.NOESISTEX_RGBA32))
+							materialFlags |= conversionFlags
+							textureBindings[bindingKey] = (conversionFlags, bindingCalls, opacityName)
 							alreadyLoadedTexs.append(texName)
 						else:
+							if strictRecords:
+								raise MaterialProfileError("tex-decode-failed")
 							print ("Failed to load", texName)
 
+				if bAlreadyLoadedTexture and bindingKey in textureBindings:
+					flags, bindingCalls, opacityName = textureBindings[bindingKey]
+					materialFlags |= flags
+					for method, args in bindingCalls:
+						getattr(material, method)(*args)
+
 				if opacityName and hasTransparency:
-					material.setAlphaTest(0.05)
+					if extraParam == "isATOS_Alpha" and (
+							not isMdfAlphaTest or record["alpha_flags_raw"] & 1):
+						materialFlags |= runtime.noesis.NMATFLAG_TWOSIDED
+					material.setAlphaTest(alphaTestRef)
 					material.setOpacityTexture(opacityName)
 					if runtime.dialogOptions.doConvertMatsForBlender:
 						material.setEnvTexture(opacityName)
@@ -837,6 +1077,7 @@ def bind_mesh_materials(runtime):
 			if secondaryDiffuse and not bFoundBM:
 				material.setTexture(secondaryDiffuse)
 				material.setSpecularColor([.25, .25, .25, 1])
+				bFoundBM = True
 
 			if texCount:
 				if not bFoundBM:
@@ -900,87 +1141,10 @@ def bind_mesh_materials(runtime):
 		return True
 
 	def _loadPragmataMaterialProfile(self, meshMaterialNames, pragmataDecoder=None):
-		import_profile = getattr(self, "importProfile", None)
-		if import_profile is None:
-			import_profile = composeImportProfile("PRAGMATA", formats["PRAGMATA"])
-		mdfPath = resolveMaterialCompanionPath(self.path, import_profile["format"])
-		if not runtime.rapi.checkFileExists(mdfPath):
-			print("PRAGMATA MDF2 exact companion not found:", mdfPath)
-			return False
-		try:
-			mdfData = runtime.rapi.loadIntoByteArray(mdfPath)
-			profile = runtime.parsePragmataMdf2Profile(mdfData, mdfPath)
-			orderedRecords = runtime.bindPragmataMaterialRecords(meshMaterialNames, profile["materials"])
-			loadRecords = []
-			allPaths = {}
-			for record in orderedRecords:
-				builderRecord = dict(record)
-				builderTextures = []
-				selected = []
-				for texture in record["textures"]:
-					builderTexture = dict(texture)
-					if (profile["material_count"] == 1 and "target_texture" in profile
-							and texture["slot"] == profile["target_texture"]["slot"]):
-						builderTexture["semantic"] = "diagnostic-mask"
-						builderTexture["preview_use"] = "diagnostic-diffuse"
-					if builderTexture.get("preview_use") in ("preview-mapping", "diagnostic-diffuse"):
-						texPath = resolveTextureResourcePath(self.path, builderTexture["path"], import_profile["format"])
-						if not runtime.rapi.checkFileExists(texPath):
-							if builderTexture.get("preview_use") == "diagnostic-diffuse":
-								raise MaterialProfileError("tex-companion-missing")
-							print("PRAGMATA optional preview texture missing:", builderTexture["slot"], "->", texPath)
-						else:
-							selected.append((builderTexture, texPath))
-							allPaths[os.path.normcase(os.path.normpath(texPath))] = texPath
-					builderTextures.append(builderTexture)
-				builderRecord["textures"] = builderTextures
-				loadRecords.append((builderRecord, selected))
-			stagedTextures = []
-			decodedByPath = {}
-			for normalizedPath, texPath in allPaths.items():
-				texData = runtime.rapi.loadIntoByteArray(texPath)
-				resourcePath = None
-				for builderRecord, selected in loadRecords:
-					for texture, selectedPath in selected:
-						if os.path.normcase(os.path.normpath(selectedPath)) == normalizedPath:
-							resourcePath = texture["path"]
-							break
-					if resourcePath is not None:
-						break
-				texBaseName = os.path.basename(resourcePath.replace("/", "\\"))
-				texName = texBaseName[:-4] + runtime.texOutputExt
-				loadedTexture = texture_import.loadTextureForImport(
-					runtime, texData, stagedTextures, texName, texPath, import_profile["texture"], pragmataDecoder
-				)
-				if not loadedTexture:
-					raise MaterialProfileError("tex-decode-failed")
-				decodedByPath[normalizedPath] = loadedTexture
-
-			stagedMaterials = []
-			for builderRecord, selected in loadRecords:
-				textureNamesBySlot = {}
-				for texture, texPath in selected:
-					normalizedPath = os.path.normcase(os.path.normpath(texPath))
-					textureNamesBySlot[texture["slot"]] = decodedByPath[normalizedPath].name
-				stagedMaterials.append(runtime.buildNoesisMaterial(builderRecord, textureNamesBySlot))
-
-			self.texList.extend(stagedTextures)
-			self.matList.extend(stagedMaterials)
-			for loadedTexture in stagedTextures:
-				if loadedTexture.name not in [tex.name for tex in self.fullTexList]:
-					self.fullTexList.append(loadedTexture)
-			for material in stagedMaterials:
-				if material.name not in [mat.name for mat in self.fullMatList]:
-					self.fullMatList.append(material)
-			profile["bound_material_names"] = [record["name"] for record in orderedRecords]
-			self.materialProfile = profile
-			print("PRAGMATA MDF2 observed profile:", profile["material_count"], "materials,", profile["texture_count"], "textures,", profile["property_count"], "properties")
-			if profile["material_count"] == 1 and "target_texture" in profile:
-				print("PRAGMATA diagnostic material texture:", profile["target_texture"]["slot"], "->", stagedMaterials[0].texName)
-			return True
-		except MaterialProfileError as error:
-			print("PRAGMATA material exact profile rejected:", str(error))
-			return False
+		# Compatibility entry point for existing callers; no separate renderer.
+		if not hasattr(self, "importProfile"):
+			self.importProfile = composeImportProfile("PRAGMATA", formats["PRAGMATA"])
+		return createMaterials(self, len(meshMaterialNames), meshMaterialNames, pragmataDecoder)
 
 	return (
 		createMaterials,

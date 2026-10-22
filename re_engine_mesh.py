@@ -4,9 +4,27 @@ import json
 import math
 import os
 import struct
+import ntpath
 from copy import deepcopy
+
+
+def shouldBindVertexColors(import_profile, path):
+	"""Do not multiply shader masks into basic-preview diffuse colors.
+
+	The raw parser retains these channels; the configured asset roots omit
+	them from Noesis model color streams (including conventional exports).
+	"""
+	path = ntpath.normpath(path).replace("\\", "/").lower()
+	marker = "/natives/" + import_profile["format"]["nDir"].strip("/\\").lower() + "/"
+	if marker not in path:
+		return True
+	relative = path.split(marker, 1)[1]
+	return not any(relative.startswith(root.lower()) for root in
+		import_profile["mesh"].get("vertex_color_mask_roots", ()))
 from re_engine_materials import loadMeshMaterials
 from re_engine_config import (
+	WILDS_240704828,
+	WILDS_MPLY_240704828,
 	PRAGMATA_250707828,
 	PRAGMATA_MPLY_250707828,
 	formats,
@@ -32,6 +50,8 @@ RUNTIME_DEPENDENCIES = (
 	'_pragmataMplyNoesisBatches',
 	'_pragmataNoesisIndexSubmission',
 	'_readMeshProfile',
+	'parseWildsMeshData',
+	'parseWildsMplyData',
 	'bAddBoneNumbers',
 	'bColorsEnabled',
 	'bDebugMESH',
@@ -229,6 +249,10 @@ def bind(runtime):
 		def setGameName(self):
 			# Shared state is owned by runtime.
 			runtime.sGameName = "RE2"
+			if self.capability in (WILDS_240704828, WILDS_MPLY_240704828):
+				runtime.isMeshVer3 = True
+				runtime.sGameName = "MHWILDS"
+				return
 			if self.capability in (PRAGMATA_250707828, PRAGMATA_MPLY_250707828):
 				runtime.isMeshVer3 = True
 				runtime.sGameName = "PRAGMATA"
@@ -273,6 +297,9 @@ def bind(runtime):
 		'''MESH IMPORT ========================================================================================================================================================================'''
 
 		def _loadPragmataMeshFile(self):
+			return self._loadProfileMeshFile()
+
+		def _loadProfileMeshFile(self):
 			snapshot = self._profileSnapshot
 			self._profileSnapshot = None
 			if snapshot is not None and snapshot[0] is self.data and snapshot[1] == self.path:
@@ -281,11 +308,15 @@ def bind(runtime):
 					self.streamingCompanionPath = snapshot[3]
 			else:
 				streaming_data = None
-				if (self.capability == PRAGMATA_MPLY_250707828 or
+				if (self.capability in (PRAGMATA_MPLY_250707828, WILDS_MPLY_240704828) or
 						self.profileHeader.get("streaming_entry_count")):
 					self.streamingCompanionPath, streaming_data = runtime.loadPragmataStreamingCompanion(
 						self.path)
 				parsed = (
+					runtime.parseWildsMeshData(self.data, self.profileHeader, streaming_data)
+					if self.capability == WILDS_240704828 else
+					runtime.parseWildsMplyData(self.data, self.profileHeader, streaming_data)
+					if self.capability == WILDS_MPLY_240704828 else
 					runtime._parsePragmataMplyData(self.data, self.profileHeader, streaming_data)
 					if self.capability == PRAGMATA_MPLY_250707828 else
 					runtime._parsePragmataMeshData(self.data, self.profileHeader, streaming_data)
@@ -296,6 +327,9 @@ def bind(runtime):
 			full_remap_offset = len(self.fullRemapTable)
 			self.materializedPreview = False
 			if runtime.bMaterialsEnabled:
+				if self.importProfile["material"]["family"] == "mdf-45-legacy":
+					self.rootDir = runtime.GetRootGameDir(self.path)
+					runtime.extractedNativesPath = runtime.LoadExtractedDir(self.gameName)
 				self.materializedPreview = loadMeshMaterials(self, parsed["material_names"])
 
 			self.boneList = []
@@ -335,7 +369,7 @@ def bind(runtime):
 
 			noesis_submeshes = (
 				runtime._pragmataMplyNoesisBatches(parsed["submeshes"])
-				if self.capability == PRAGMATA_MPLY_250707828 else
+				if self.capability in (PRAGMATA_MPLY_250707828, WILDS_MPLY_240704828) else
 				parsed["submeshes"]
 			)
 			if not runtime.bImportAllLODs:
@@ -371,7 +405,8 @@ def bind(runtime):
 						yield ("bone_map", (self.fullRemapTable,))
 						yield ("bone_indices", (bone_index_buffer, runtime.noesis.RPGEODATA_USHORT, bone_weight_count * 2, vertex_start * bone_weight_count * 2, bone_weight_count,))
 						yield ("bone_weights", (bone_weight_buffer, runtime.noesis.RPGEODATA_UBYTE, bone_weight_count, vertex_start * bone_weight_count, bone_weight_count,))
-					if runtime.bColorsEnabled and 5 in vertex_elements:
+					if (runtime.bColorsEnabled and 5 in vertex_elements and
+							shouldBindVertexColors(self.importProfile, self.path)):
 						color = vertex_elements[5]
 						yield ("color", (vertex_buffer, runtime.noesis.RPGEODATA_UBYTE, color["stride"], color["offset"] + color["stride"] * vertex_start, 4,))
 				bindMeshVertexStreams(runtime.rapi, profileVertexStreams())
@@ -404,8 +439,9 @@ def bind(runtime):
 		def loadMeshFile(self): #, mdlList):
 
 			# Shared state is owned by runtime.
-			if self.capability in (PRAGMATA_250707828, PRAGMATA_MPLY_250707828):
-				return self._loadPragmataMeshFile()
+			if self.capability in (PRAGMATA_250707828, PRAGMATA_MPLY_250707828,
+					WILDS_240704828, WILDS_MPLY_240704828):
+				return self._loadProfileMeshFile()
 
 			self.rootDir = runtime.GetRootGameDir(self.path)
 			runtime.extractedNativesPath = runtime.LoadExtractedDir(runtime.sGameName)

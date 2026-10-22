@@ -19,17 +19,24 @@ from re_engine_types import (
 # Host/state/callback dependencies (resolved on use, never copied).
 RUNTIME_DEPENDENCIES = ('NoeBitStream', 'NoeTexture', 'convertTexVersion', 'findSourceTexFile', 'noesis', 'rapi', 'readUByteAt', 'readUIntAt', 'texFile')
 
-TEXTURE_IMPORT_RUNTIME_DEPENDENCIES = ('NoeBitStream', 'NoeTexture', 'bImportMips', 'convertTexVersion', 'decodePragmataTexMips', 'loadGDeflateDecoder', 'noesis', 'parsePragmataTexProfile', 'preparePragmataTexSurface', 'rapi', 'readTextureData')
+TEXTURE_IMPORT_RUNTIME_DEPENDENCIES = ('NoeBitStream', 'NoeTexture', 'bImportMips', 'convertTexVersion', 'decodePragmataTexMips', 'loadGDeflateDecoder', 'noesis', 'parsePragmataTexProfile', 'parseWildsTexProfile', 'preparePragmataTexSurface', 'rapi', 'readTextureData')
 
 
 def parsePragmataTexProfile(data, path):
-	if not path.lower().endswith((".tex" + formats["PRAGMATA"]["texExt"])):
+	return _parseChunkTexProfile(data, path, formats["PRAGMATA"]["texVersion"],
+		".tex" + formats["PRAGMATA"]["texExt"])
+
+def parseWildsTexProfile(data, path):
+	return _parseChunkTexProfile(data, path, 241106027, ".tex.241106027")
+
+def _parseChunkTexProfile(data, path, expected_version, expected_suffix):
+	if not path.lower().endswith(expected_suffix):
 		raise MaterialProfileError("tex-suffix-mismatch")
 	_materialCheckedRange(data, 0, 0x28, "tex-header")
 	if data[0:4] != b"TEX\0":
 		raise MaterialProfileError("tex-magic-mismatch")
 	version = _materialScalar(data, 4, "<I", "tex-version")
-	if version != formats["PRAGMATA"]["texVersion"]:
+	if version != expected_version:
 		raise MaterialProfileError("tex-version-mismatch")
 	width, height, depth = struct.unpack_from("<HHH", data, 8)
 	image_count = data[0x0E]
@@ -167,15 +174,22 @@ def appendTextureSurface(texture_type, pixel_type, textures, surface):
 
 def loadTextureForImport(runtime, data, textures, texture_name, source_path, texture_profile=None, decoder=None):
 	texture_name = texture_name or runtime.rapi.getInputName()
-	modern_data = len(data) >= 8 and struct.unpack_from("<I", data, 4)[0] == formats["PRAGMATA"]["texVersion"]
-	family = texture_profile["family"] if texture_profile is not None else ("tex-251111100" if modern_data else "legacy")
-	if family not in ("legacy", "tex-251111100"):
+	version = struct.unpack_from("<I", data, 4)[0] if len(data) >= 8 else None
+	profilePath = source_path or runtime.rapi.getInputName()
+	family = texture_profile["family"] if texture_profile is not None else "legacy"
+	if family not in ("legacy", "tex-251111100", "tex-241106027"):
 		raise MaterialProfileError("unsupported-texture-import-family")
 	# A known on-disk identity retains its validation even through a legacy caller.
-	if modern_data or family == "tex-251111100":
+	modern_version = version if version in (251111100, 241106027) else None
+	if modern_version is None:
+		for candidate in (251111100, 241106027):
+			if (candidate == 241106027 and profilePath.lower().endswith(".tex.241106027")) or family == "tex-" + str(candidate):
+				modern_version = candidate
+				break
+	if modern_version is not None:
 		try:
-			profilePath = source_path or runtime.rapi.getInputName()
-			profile = runtime.parsePragmataTexProfile(data, profilePath)
+			parser = runtime.parseWildsTexProfile if modern_version == 241106027 else runtime.parsePragmataTexProfile
+			profile = parser(data, profilePath)
 			decoder = decoder or runtime.loadGDeflateDecoder()
 			decodedMips = runtime.decodePragmataTexMips(data, profile, decoder)
 			tex = False
@@ -198,10 +212,10 @@ def loadTextureForImport(runtime, data, textures, texture_name, source_path, tex
 				tex = appendTextureSurface(runtime.NoeTexture, runtime.noesis.NOESISTEX_RGBA32,
 					textures, (imageName, mip["width"], mip["height"], texData))
 			fmtName = texFormatNames.get(profile["format"], str(profile["format"]))
-			print("PRAGMATA TEX profile:", profile["width"], "x", profile["height"], "x", profile["depth"], fmtName + ",", profile["image_count"], "images,", profile["mip_count"], "mips")
+			print("Chunk TEX profile:", profile["width"], "x", profile["height"], "x", profile["depth"], fmtName + ",", profile["image_count"], "images,", profile["mip_count"], "mips")
 			return tex
 		except MaterialProfileError as error:
-			print("PRAGMATA TEX exact profile rejected:", str(error))
+			print("Chunk TEX profile rejected:", str(error))
 			return 0
 	bs = runtime.NoeBitStream(data)
 	magic = bs.readUInt()
@@ -684,6 +698,7 @@ def bind(runtime):
 
 	return (
 		parsePragmataTexProfile,
+		parseWildsTexProfile,
 		decodePragmataTexMips,
 		preparePragmataTexSurface,
 		texCheckType,

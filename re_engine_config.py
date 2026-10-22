@@ -72,6 +72,18 @@ PRAGMATA_MPLY_VERTEX_FLAGS = frozenset((
 	0x84848310, 0x84849310, 0x8484A310,
 ))
 
+WILDS_240704828 = MeshCapability(
+	"wilds-240704828-observed-v1", 240704828,
+	"wilds-observed-v1", "wilds-observed-v1",
+	"wilds-observed-v1", "wilds-observed-v1",
+)
+
+WILDS_MPLY_240704828 = MeshCapability(
+	"wilds-240704828-mply-v1", 240704828,
+	"wilds-mply-v1", "cluster-streaming",
+	"meshlet-u8", "none",
+)
+
 PRAGMATA_HEADER_FIELDS = (
 	("vertices_offset", 0x28),
 	("lod_offset", 0x30),
@@ -119,6 +131,7 @@ formats = {
 	"AJ_AAT": 		{ "modelExt": ".230612127",  "texExt": ".719230324", "mmtrExt": ".230815080",  "nDir": "stm", "mdfExt": ".mdf2.37", "meshVersion": 3, "mdfVersion": 4, "mlistExt": ".750", "meshMagic":230406984, "motionIDsData":[72,8] },
 	"DD2": 			{ "modelExt": ".231011879",  "texExt": ".760230703", "mmtrExt": ".230815080",  "nDir": "stm", "mdfExt": ".mdf2.40", "meshVersion": 3, "mdfVersion": 4, "mlistExt": ".751", "meshMagic":230517984, "motionIDsData":[72,8] },
 	"DRDR": 		{ "modelExt": ".240424828",  "texExt": ".240606151", "mmtrExt": ".240405143",  "nDir": "stm", "mdfExt": ".mdf2.40", "meshVersion": 3, "mdfVersion": 4, "mlistExt": ".854", "meshMagic":240423829, "motionIDsData":[72,8] },
+	"MHWILDS": {"modelExt": ".241111606", "meshMagic": 240704828, "texExt": ".241106027", "texVersion": 241106027, "mdfExt": ".mdf2.45", "mdfVersion": 4, "meshVersion": 3, "nDir": "stm", "mlistExt": "", "mmtrExt": "", "motionIDsData": [72,8]},
 	"PRAGMATA": 	{ "texVersion": 251111100, "modelExt": ".251121828",  "texExt": ".251111100",   "mmtrExt": "",            "nDir": "stm", "mdfExt": ".mdf2.51", "meshVersion": 3, "mdfVersion": 5, "mlistExt": "",     "meshMagic":250707828, "motionIDsData":[72,8] },
 }
 
@@ -151,6 +164,13 @@ formats["PRAGMATA"]["import"]["material"]["family"] = "mdf-51-observed"
 formats["PRAGMATA"]["import"]["texture"]["family"] = "tex-251111100"
 formats["PRAGMATA"]["import"]["motion"].update(
 	family="motlist-1057-mot-993", file_suffix=".motlist.1057")
+formats["MHWILDS"]["import"]["mesh"].update(
+	family="mesh-240704828", construction="ordinary-sort-strict",
+	vertex_color_mask_roots=("art/model/character/",))
+formats["MHWILDS"]["import"]["material"]["family"] = "mdf-45-legacy"
+formats["MHWILDS"]["materialGenderFallback"] = True
+formats["MHWILDS"]["import"]["texture"]["family"] = "tex-241106027"
+formats["MHWILDS"]["import"]["motion"].update(family="motlist-992-mot-932", file_suffix=".992")
 del _record, _name
 
 
@@ -164,6 +184,10 @@ def composeImportProfile(game_name, format_record, mesh_capability=None):
 		profile["mesh"].update(family="mply-250707828", construction="mply-unsorted-strict")
 	elif mesh_capability == PRAGMATA_250707828:
 		profile["mesh"].update(family="mesh-250707828", construction="ordinary-sort-strict")
+	elif mesh_capability == WILDS_240704828:
+		profile["mesh"].update(family="mesh-240704828", construction="ordinary-sort-strict")
+	elif mesh_capability == WILDS_MPLY_240704828:
+		profile["mesh"].update(family="mesh-240704828-mply", construction="mply-unsorted-strict")
 	return profile
 
 
@@ -449,7 +473,7 @@ fmtNameToBpp = {
     "BC4_SNORM": 4
 }
 
-gamesList = [ "RE7", "RE7RT", "RE2", "RERT", "RE3", "RE4", "RE8", "MHRSunbreak", "DMC5", "SF6", "ReVerse", "ExoPrimal", "AJ_AAT", "DD2", "DRDR", "PRAGMATA" ]
+gamesList = [ "RE7", "RE7RT", "RE2", "RERT", "RE3", "RE4", "RE8", "MHRSunbreak", "DMC5", "SF6", "ReVerse", "ExoPrimal", "AJ_AAT", "DD2", "DRDR", "PRAGMATA", "MHWILDS" ]
 
 fullGameNames = [
 	"Resident Evil 7",
@@ -468,4 +492,5 @@ fullGameNames = [
 	"Dragon's Dogma 2",
 	"Dead Rising DR",
 	"Pragmata",
+	"Monster Hunter Wilds",
 ]

@@ -119,9 +119,10 @@ class CachedMotlistSelectionSource:
 	"""Path/slot selection policy, including compatibility with injected sources."""
 	selectionOnly = True
 	previewSpeed = None
-	def __init__(self, runtime, source_type, import_profile=None):
+	def __init__(self, runtime, source_type, import_profile=None, builder=None):
 		self.runtime = runtime
 		self.sourceType = source_type
+		self.builder = builder or runtime.buildPragmataMotlist1057MultiModel
 		self.gameName = import_profile["game_name"] if import_profile is not None else source_type.gameName
 		self.fileSuffix = import_profile["motion"]["file_suffix"] if import_profile is not None else source_type.fileSuffix
 
@@ -162,7 +163,7 @@ class CachedMotlistSelectionSource:
 
 	def buildForModel(self, model, dialog, target_bones, mode):
 		first = dialog.selectedActions[0]
-		animation_model = self.runtime.buildPragmataMotlist1057MultiModel(
+		animation_model = self.builder(
 			b"", first["path"], dialog.selectedActions, first["decoded"],
 			mesh_bones=target_bones if mode == "mesh" else None)
 		return animation_model.bones, animation_model.anims
@@ -170,10 +171,15 @@ class CachedMotlistSelectionSource:
 
 def makeAnimationSelectionSource(runtime, import_profile):
 	family = import_profile["motion"]["family"]
+	if family == "unavailable":
+		return None
 	if family == "legacy":
 		return LegacyMotlistSelectionSource(runtime, import_profile)
 	if family == "motlist-1057-mot-993":
 		return CachedMotlistSelectionSource(runtime, runtime.PragmataMotlistSelectionSource, import_profile)
+	if family == "motlist-992-mot-932":
+		return CachedMotlistSelectionSource(runtime, runtime.WildsMotlistSelectionSource, import_profile,
+			builder=runtime.buildWildsMotlist992Model)
 	raise MeshProfileError("unsupported-motion-import-family")
 
 
@@ -241,6 +247,7 @@ def loadMotionImport(runtime, data, path, import_profile=None):
 		game = runtime.sGameName if runtime.sGameName in formats else "RE2"
 		for name, record in formats.items():
 			if (record["import"]["motion"]["family"] != "legacy" and
+					record["import"]["motion"]["file_suffix"] and
 					path.lower().endswith(record["import"]["motion"]["file_suffix"])):
 				game = name
 				break
@@ -487,6 +494,29 @@ def bind(runtime):
 					slots.append(slot_index)
 			return slots
 
+	class WildsMotlistSelectionSource(PragmataMotlistSelectionSource):
+		gameName = "MHWILDS"
+		fileSuffix = ".992"
+
+		def __init__(self, decoded, path):
+			PragmataMotlistSelectionSource.__init__(self, decoded, path)
+			self.unavailable_entries = decoded.get("skipped_entries", [])
+			for entry in self.unavailable_entries:
+				print("MOTLIST: unavailable slot %s (%s): %s" % (
+					entry["slot_index"], entry.get("name", ""), entry.get("reason", "unsupported")))
+
+		@classmethod
+		def load(cls, path):
+			return cls(re_common.decode_wilds_motlist_992(
+				runtime.rapi.loadIntoByteArray(path), path, error_type=MeshProfileError), path)
+
+		def selection_for_slot(self, slot_index):
+			for action in self.decoded["actions"]:
+				if action["slot_index"] == slot_index:
+					return dict(path=self.path, decoded=self.decoded, slot_index=slot_index,
+						motion_id=action["motion_id"])
+			raise MeshProfileError("structural-profile-mismatch:animation-selection")
+
 	def _mapAnimationTracks(tracks, source_bones, mesh_bones):
 		# Keep the MESH bind pose and weight indices; only remap animation tracks.
 		by_hash = {}
@@ -517,11 +547,93 @@ def bind(runtime):
 			mapped.append(mapped_track)
 		return mapped
 
+	def _mapWildsAnimationTracks(tracks, source_bones, mesh_bones):
+		# Only the observed virtual root and six childless IK leaves may be absent.
+		leaves = set(name for name in (
+			"L_Arm_IK", "R_Arm_IK", "L_Leg_IK", "R_Leg_IK", "L_WingArm_IK", "R_WingArm_IK"))
+		targets = {}
+		for index, bone in enumerate(mesh_bones):
+			name = runtime.cleanBoneName(bone.name)
+			key = runtime.hash_wide(name, True)
+			if key in targets or bone.index != index:
+				raise MeshProfileError("animation-binding-ambiguous-target")
+			targets[key] = (index, name)
+		by_name, hashes, children = {}, set(), {}
+		for index, bone in enumerate(source_bones):
+			name, parent = bone["name"], bone["parent_index"]
+			if (bone["index"] != index or name in by_name or bone["hash"] in hashes or
+					bone["hash"] != runtime.hash_wide(name, True)):
+				raise MeshProfileError("animation-binding-source-identity")
+			if parent is not None and (parent < 0 or parent >= index):
+				raise MeshProfileError("animation-binding-source-parent")
+			by_name[name] = index
+			hashes.add(bone["hash"])
+			children.setdefault(parent, []).append(index)
+		if not {"Scale_Base", "root"}.union(leaves).issubset(set(by_name)):
+			raise MeshProfileError("animation-binding-helper-contract")
+		base, root = by_name["Scale_Base"], by_name["root"]
+		virtual = source_bones[base]
+		if (children.get(None) != [base] or children.get(base) != [root] or
+				tuple(virtual["local_translation"]) != (0., 0., 0.) or
+				tuple(virtual["local_rotation"]) != (0., 0., 0., 1.) or
+				tuple(virtual["local_scale"]) != (1., 1., 1.)):
+			raise MeshProfileError("animation-binding-virtual-root")
+		mapping = {}
+		for index, bone in enumerate(source_bones):
+			name = bone["name"]
+			target = targets.get(bone["hash"])
+			if name == "Scale_Base" or name in leaves:
+				if target is not None or (name in leaves and
+						(bone["parent_index"] != root or children.get(index))):
+					raise MeshProfileError("animation-binding-helper-contract")
+				mapping[index] = None
+			else:
+				if target is None or target[1] != name:
+					raise MeshProfileError("animation-binding-missing-bone:" + bone["name"])
+				mapping[index] = target[0]
+		for index, target in mapping.items():
+			if target is not None:
+				parent = source_bones[index]["parent_index"]
+				expected = -1 if parent == base else mapping.get(parent)
+				if expected is None or mesh_bones[target].parentIndex != expected:
+					raise MeshProfileError("animation-binding-parent")
+		mapped = []
+		for track in tracks:
+			index = track["bone_index"]
+			if (index not in mapping or index == base or
+					source_bones[index]["hash"] != track["bone_hash"] or
+					track["kind"] not in ("translation", "rotation")):
+				raise MeshProfileError("animation-binding-track")
+			row = dict(track)
+			row["bone_index"] = mapping[index]
+			row["binding_status"] = "bound" if mapping[index] is not None else "external-skeleton-required"
+			mapped.append(row)
+		return mapped
+
+	def buildWildsMotlist992Model(data, path, selected_slots=None, decoded=None, mesh_bones=None):
+		if mesh_bones is None:
+			raise MeshProfileError("animation-binding-model-required")
+		if decoded is None:
+			decoded = re_common.decode_wilds_motlist_992(data, path, error_type=MeshProfileError)
+		sources = [decoded]
+		if selected_slots and isinstance(selected_slots[0], dict):
+			sources.extend(row.get("decoded", {}) for row in selected_slots)
+		for source in sources:
+			if source.get("schema") != "wilds-motlist-animation-set/v1" or source.get("time_unit") != "frames":
+				raise MeshProfileError("animation-binding-source-profile")
+		return _buildSelectedMotionModel(decoded, path, selected_slots, mesh_bones,
+			_mapWildsAnimationTracks, "wilds-motlist-992-mot-932-model-bound-v1", "Wilds")
+
 	def buildPragmataMotlist1057MultiModel(
 			data, path, selected_slots=None, decoded=None, mesh_bones=None):
 		if decoded is None:
 			decoded = re_common.decode_pragmata_motlist_1057_multi(
 				data, path, error_type=MeshProfileError)
+		return _buildSelectedMotionModel(decoded, path, selected_slots, mesh_bones,
+			_mapAnimationTracks, PRAGMATA_MOTLIST_1057_MULTI_CAPABILITY, "PRAGMATA")
+
+	def _buildSelectedMotionModel(decoded, path, selected_slots, mesh_bones,
+			map_tracks, capability, label):
 		selected_rows = []
 		if selected_slots is None:
 			selected_rows = [(decoded, action) for action in decoded["actions"]]
@@ -542,7 +654,8 @@ def bind(runtime):
 					(action["slot_index"], action)
 					for action in selection_decoded["actions"])
 				identity = (selection_path, slot_index)
-				if identity in seen_actions or slot_index not in actions_by_slot:
+				if (identity in seen_actions or slot_index not in actions_by_slot or
+						("motion_id" in selection and selection["motion_id"] != actions_by_slot[slot_index]["motion_id"])):
 					raise MeshProfileError(
 						"structural-profile-mismatch:animation-selection")
 				seen_actions.add(identity)
@@ -562,7 +675,7 @@ def bind(runtime):
 		for selection_decoded, action in selected_rows:
 			tracks = action["tracks"]
 			if mesh_bones is not None:
-				tracks = _mapAnimationTracks(tracks, selection_decoded["bones"], mesh_bones)
+				tracks = map_tracks(tracks, selection_decoded["bones"], mesh_bones)
 			selected_track_count += len(tracks)
 			keyframed_bones, action_skipped = (
 				runtime._buildPragmataMotlistKeyFramedBones(
@@ -587,21 +700,29 @@ def bind(runtime):
 				entry["slot_index"]
 				for entry in selection_decoded.get("skipped_entries", []))
 		if mtre_slots:
-			print("PRAGMATA MOTLIST: skipped MTRE slots: " +
+			print(label + (" MOTLIST: skipped MTRE slots: " if label == "PRAGMATA" else " MOTLIST: unavailable slots: ") +
 				  ", ".join(str(value) for value in mtre_slots))
 		if skipped_external:
-			print("PRAGMATA MOTLIST: skipped external-skeleton tracks: " +
+			print(label + (" MOTLIST: skipped external-skeleton tracks: " if label == "PRAGMATA" else " MOTLIST: ignored auxiliary leaf tracks: ") +
 				  str(skipped_external))
 		rates = sorted(set(action["frame_rate"] for action in selected_actions))
 		if len(rates) == 1:
 			runtime.rapi.setPreviewOption("setAnimSpeed", str(float(rates[0])))
 		elif rates:
-			print("PRAGMATA MOTLIST: animation FPS values: " +
+			print(label + " MOTLIST: animation FPS values: " +
 				  ", ".join(runtime._formatPragmataMotlistRate(rate) for rate in rates))
-		runtime._printPragmataMotlistStats(
-			PRAGMATA_MOTLIST_1057_MULTI_CAPABILITY, bones, animations,
-			selected_track_count - skipped_external,
-			skipped_external, len(mtre_slots))
+		if label == "PRAGMATA":
+			runtime._printPragmataMotlistStats(
+				capability, bones, animations,
+				selected_track_count - skipped_external,
+				skipped_external, len(mtre_slots))
+		else:
+			print("RE_MOTLIST_STATS_JSON:" + json.dumps(dict(
+				schema="noesis-wilds-motlist-stats/v1", capability=capability,
+				bone_count=len(bones), animation_count=len(animations),
+				bound_track_count=selected_track_count-skipped_external,
+				ignored_auxiliary_leaf_track_count=skipped_external,
+				unavailable_entry_count=len(mtre_slots)), sort_keys=True))
 		return model
 
 	def getGlobalMatrix(noebone, bonesList): #doesnt work 100%?
@@ -727,7 +848,9 @@ def bind(runtime):
 		_printPragmataMotlistStats,
 		PragmataMotlistSelectionMotion,
 		PragmataMotlistSelectionSource,
+		WildsMotlistSelectionSource,
 		buildPragmataMotlist1057MultiModel,
+		buildWildsMotlist992Model,
 		getGlobalMatrix,
 		getChildBones,
 		cleanBoneName,

@@ -6,6 +6,8 @@ from re_engine_runtime import beginImportSession
 from re_engine_config import (
 	formats,
 	composeImportProfile,
+	WILDS_240704828,
+	WILDS_MPLY_240704828,
 	PRAGMATA_250707828,
 	PRAGMATA_MPLY_250707828,
 )
@@ -14,7 +16,7 @@ from re_engine_types import (
 )
 
 # Host/state/callback dependencies (resolved on use, never copied).
-RUNTIME_DEPENDENCIES = ('NoeBitStream', 'NoeModel', 'NoeModelMaterials', 'Version', '_detectPragmataIdentity', '_parsePragmataMeshData', '_parsePragmataMplyData', 'collapseBones', 'detectMeshCapability', 'dialogOptions', 'generateBoneMap', 'loadPragmataStreamingCompanion', 'meshFile', 'noesis', 'openOptionsDialogImportWindow', 'parsePragmataHeader', 'parsePragmataMplyHeader', 'rapi', 'sGameName')
+RUNTIME_DEPENDENCIES = ('NoeBitStream', 'NoeModel', 'NoeModelMaterials', 'Version', 'detectWildsMeshIdentity', 'parseWildsMeshHeader', 'parseWildsMeshData', 'parseWildsMplyHeader', 'parseWildsMplyData', '_detectPragmataIdentity', '_parsePragmataMeshData', '_parsePragmataMplyData', 'collapseBones', 'detectMeshCapability', 'dialogOptions', 'generateBoneMap', 'loadPragmataStreamingCompanion', 'meshFile', 'noesis', 'openOptionsDialogImportWindow', 'parsePragmataHeader', 'parsePragmataMplyHeader', 'rapi', 'sGameName')
 
 
 
@@ -27,11 +29,19 @@ def loadSelectedMeshes(runtime, session, dialog):
 	strict_suffixes = tuple(record["modelExt"] for record in formats.values()
 		if record["import"]["mesh"]["construction"] != "legacy-sort-fallback")
 	candidates = [path for path in dialog.fullLoadItems if path.lower().endswith(strict_suffixes)]
+	# Wilds has only single-model evidence. Reject its mixed queue before any
+	# model can publish geometry, bones or materials into the shared session.
+	if len(dialog.fullLoadItems) > 1:
+		for path in candidates:
+			if path.lower().endswith(formats["MHWILDS"]["modelExt"]):
+				print("RE_MESH_PROFILE_ERROR:multiple-wilds-load-items")
+				return None
 	if len(candidates) > 1:
 		count = 0
 		for path in candidates:
 			capability = runtime.detectMeshCapability(runtime.rapi.loadIntoByteArray(path), path)
-			if capability in (PRAGMATA_250707828, PRAGMATA_MPLY_250707828):
+			if capability in (PRAGMATA_250707828, PRAGMATA_MPLY_250707828,
+					WILDS_240704828, WILDS_MPLY_240704828):
 				count += 1
 		if count > 1:
 			print("RE_MESH_PROFILE_ERROR:multiple-pragmata-load-items")
@@ -86,7 +96,34 @@ def constructImportedModel(runtime, construction_rule):
 
 
 def bind(runtime):
+	def _meshInputPath():
+		path = runtime.rapi.getInputName()
+		if path.lower().endswith(".noesis"):
+			# Native scenes keep the parent as input name while invoking us
+			# with child MESH bytes. Resolve the child once, before any reads.
+			checked = getattr(runtime.rapi, "getLastCheckedName", None)
+			path = checked() if checked is not None else ""
+			suffixes = tuple(".mesh" + record["modelExt"] for record in formats.values())
+			# Registered legacy aliases have no separate formats record.
+			suffixes += (".mesh.220301866", ".mesh.220721329", ".newmesh")
+			if not path or not path.lower().endswith(suffixes):
+				raise MeshProfileError("scene-mesh-path-missing-or-invalid")
+		return path
+
 	def _readMeshProfile(data, path):
+		capability = runtime.detectWildsMeshIdentity(data, path)
+		if capability == WILDS_240704828:
+			header = runtime.parseWildsMeshHeader(data, path)
+			companion_path, streaming_data = (None, None)
+			if header.get("streaming_entry_count"):
+				companion_path, streaming_data = runtime.loadPragmataStreamingCompanion(path)
+			parsed = runtime.parseWildsMeshData(data, header, streaming_data)
+			return (capability, header, parsed, companion_path)
+		if capability == WILDS_MPLY_240704828:
+			header = runtime.parseWildsMplyHeader(data, path)
+			companion_path, streaming_data = runtime.loadPragmataStreamingCompanion(path)
+			parsed = runtime.parseWildsMplyData(data, header, streaming_data)
+			return (capability, header, parsed, companion_path)
 		capability = runtime._detectPragmataIdentity(data, path)
 		if capability is None:
 			return (None, None, None, None)
@@ -107,11 +144,14 @@ def bind(runtime):
 		return _readMeshProfile(data, path)[0]
 
 	def meshCheckType(data):
-		input_name = runtime.rapi.getInputName()
-		if input_name.lower().endswith(".251121828"):
+		try:
+			input_name = _meshInputPath()
+		except MeshProfileError as error:
+			print("RE_MESH_PROFILE_ERROR:" + str(error))
+			return 0
+		if input_name.lower().endswith((".251121828", ".241111606")):
 			try:
-				runtime.detectMeshCapability(data, input_name)
-				return 1
+				return 1 if runtime.detectMeshCapability(data, input_name) is not None else 0
 			except MeshProfileError as error:
 				print("RE_MESH_PROFILE_ERROR:" + str(error))
 				return 0
@@ -137,8 +177,8 @@ def bind(runtime):
 		print("\n\n	RE Engine MESH model import", runtime.Version, "by alphaZomega\n")
 
 		ctx = runtime.rapi.rpgCreateContext()
-		session = beginImportSession(runtime, "mesh", runtime.rapi.getInputName())
-		mesh = runtime.meshFile(data)
+		session = beginImportSession(runtime, "mesh", _meshInputPath())
+		mesh = runtime.meshFile(data, session.input_path)
 		session.profile = getattr(mesh, "importProfile", None)
 		session.resources = {"bones": mesh.fullBoneList, "remap": mesh.fullRemapTable,
 			"textures": mesh.fullTexList, "materials": mesh.fullMatList}
@@ -156,7 +196,7 @@ def bind(runtime):
 		if session.profile["mesh"]["construction"] != "mply-unsorted-strict":
 			meshArgs["animationSource"] = makeAnimationSelectionSource(runtime, session.profile)
 		dialog = runtime.openOptionsDialogImportWindow(None, None, meshArgs)
-		dialog.path = runtime.rapi.getInputName()
+		dialog.path = session.input_path
 		dialog.createMeshWindow()
 
 		while runtime.dialogOptions.motDialog and runtime.dialogOptions.motDialog.isOpen:

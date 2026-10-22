@@ -64,3 +64,8 @@ from re_engine_motlist_1057 import (
 	_decode_motlist_1057_exact,
 	decode_pragmata_motlist_1057_exact,
 )
+
+from re_engine_motlist_992 import (
+	parse_wilds_motlist_992,
+	decode_wilds_motlist_992,
+)

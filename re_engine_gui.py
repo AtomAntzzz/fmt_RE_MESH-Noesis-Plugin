@@ -179,6 +179,8 @@ def bind(runtime):
 				runtime.dialogOptions.currentDir = self.currentDir
 
 		def openMotlistDialogButton(self, noeWnd, controlId, wParam, lParam):
+			if "animationSource" in self.args and self.args["animationSource"] is None:
+				return
 			if not runtime.dialogOptions.motDialog or not runtime.dialogOptions.motDialog.isOpen:
 				runtime.dialogOptions.motDialog = runtime.openOptionsDialogImportWindow(None, None, {
 					"isMotlist": True,
@@ -533,6 +535,9 @@ def bind(runtime):
 				self.noeWnd.doModal()
 
 		def createMeshWindow(self, width=runtime.dialogOptions.width, height=runtime.dialogOptions.height):
+			if runtime.noesis.optWasInvoked("-b") or runtime.noesis.optWasInvoked("-noprompt") or runtime.bNoImportMenu:
+				self.isOpen = False
+				return
 
 			if self.create(width, height):
 				self.noeWnd.setFont("Futura", 14)
@@ -573,7 +578,9 @@ def bind(runtime):
 					self.LODsCheckbox = self.noeWnd.getControlByIndex(index)
 					self.LODsCheckbox.setChecked(dialogOptions.doLODs)'''
 
-					self.noeWnd.createButton("Select Animations", 150, runtime.iListboxSize+325, 200, 30, self.openMotlistDialogButton)
+					index = self.noeWnd.createButton("Select Animations", 150, runtime.iListboxSize+325, 200, 30, self.openMotlistDialogButton)
+					if "animationSource" in self.args and self.args["animationSource"] is None:
+						self.noeWnd.enableControlByIndex(index, False)
 
 				self.noeWnd.createStatic("Game:", width-248, runtime.iListboxSize+270, 60, 20)
 				index = self.noeWnd.createComboBox(width-200, runtime.iListboxSize+265, 180, 20, self.selectGameBoxItem, runtime.noewin.CBS_DROPDOWNLIST) #CB

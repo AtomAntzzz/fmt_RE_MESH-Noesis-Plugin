@@ -8,7 +8,7 @@ This repository combines alphaZomega's Noesis plugin for RE Engine assets with A
 
 - `fmt_RE_MESH.py`: the Noesis plugin for RE Engine MESH, TEX, MDF/MDF2, MOTLIST, and related assets.
 - `re_engine_*.py`: internal modules organized by responsibility; `re_engine_common.py` preserves the original shared interfaces. Install these alongside the entry point.
-- `pragmata_gdeflate_x86.dll` / `pragmata_gdeflate_x64.dll`: the GDeflate CPU bridge required by PRAGMATA TEX.
+- `pragmata_gdeflate_x86.dll` / `pragmata_gdeflate_x64.dll`: the GDeflate CPU bridge used by compressed PRAGMATA and Monster Hunter Wilds TEX files.
 - `REEM_Noesis_Maya.py`: a Maya tool that drives Noesis for MESH/MOTLIST import, reads animation logs, and splits clips in batches.
 
 ## Supported games
@@ -25,62 +25,77 @@ This repository combines alphaZomega's Noesis plugin for RE Engine assets with A
 - Apollo Justice: Ace Attorney Trilogy
 - Dragon's Dogma 2
 - PRAGMATA (models, materials, textures, standalone skeletal animation, and mesh animation binding; see scope below)
+- Monster Hunter Wilds (models, basic materials, textures, and mesh-bound animation; see scope below)
 
-The first 11 games retain alphaZomega's public v3.28 support list; PRAGMATA support is added by this fork. Available features vary by game. Resident Evil 9 and Monster Hunter Wilds are outside this repository's current verified statement. PRAGMATA support covers observed profiles only; it is not a claim for every build, character, or file sharing the same suffix.
+The first 11 games retain alphaZomega's public v3.28 support list; PRAGMATA and Monster Hunter Wilds support are added by this fork. Features vary by game. Wilds is implemented in the local branch and has not yet been integrated into the public release. Resident Evil 9 is not on the supported list.
 
-## PRAGMATA support scope
+Games share a basic material preview pipeline: locate the model's materials and textures, then apply common mappings for supported color, normal/roughness, transparency, and emission slots. PRAGMATA now uses this pipeline in the local branch; this change is not yet publicly released. Noesis provides an approximate preview, without reproducing full game shaders. Eyes, skin, and layered materials may look different. UE-specific materials and one-click import by slot are not implemented.
 
-`readable` means that a frozen structural profile can be read safely. `previewable` additionally requires separate Noesis preview evidence. Capability selection uses internal versions and structural invariants, not the game name or external suffix alone.
+## Monster Hunter Wilds: available features
 
-| Asset | Observed identity | Current statement |
+Model, basic material, and texture import and preview are supported, along with binding and playback of compatible animations. Validation uses Windows Steam build 24705561; other builds and game-wide compatibility coverage have not been measured.
+
+| Feature | Available behavior | Known limitations |
 | --- | --- | --- |
-| MESH/MPLY | `.mesh.251121828`, internal `250707828`, `MESH` or `MPLY` magic | Frozen ordinary candidate 002, standalone multi-material, standalone multi-LOD, the RE-067A reserved-ushort submission boundary, candidate 001 paired streaming, the RE-067B compact one-entry paired-streaming profile, the RE-067C binary16 blend-shape profile, paired MPLY, playergame, and face base-geometry profiles are scoped `readable`; only subsets with separate Noesis GUI evidence are `previewable`. |
-| TEX | `.tex.251111100`, internal `251111100` | The observed structural matrix is bounds-safe `readable`; the original 256×256 BC7 / 6-mip exact profile has an independent pixel oracle and is `previewable`. Other formats are limited to the representative evidence below. |
-| MDF2 | `.mdf2.51`, observed header version `1` | The candidate 002 single-material exact profile and observed playergame/face multi-material profiles can be parsed and bound. Proprietary master-shader fidelity is not claimed. |
-| MOTLIST | Frozen `.motlist.1057` / MOT `993` standalone profiles | The RE-066 single-action/local-bone exact profile and RE-068's 24 observed multi-action/shared-bones profiles are scoped `readable` / `previewable`, using the same shared animation selection dialog as DD2. RE-086 separately validates player mesh animation binding as described below. |
+| Models | Geometry, skeletons, weights, LODs, paired streaming data, and observed MPLY layouts; representative previews cover a static four-part player, handheld/worn equipment, humanoid/nonhuman characters, a building canopy, small props, a simplified tree, and low foliage | 75 of 80 fixed models pass basic material import; 5 are rejected for position encoding or streaming index layouts. Another 5 plant samples pass. Assembled-body animation, other layouts, and game-wide coverage are unverified |
+| Materials | Shared lookup tries the exact name, `_mat`, `_00`, `_v00`, and `_a`, then the same game's extraction directory and optional shared-material links with mesh/MDF hash checks; basic color, normal/roughness, and emissive display | Ordinary candidates retain priority; other variants can be selected manually. Links need a verified scene context. Player skin colors may differ between parts, and some terrain appears very dark with default lighting; proprietary shaders and complex blending are not fully supported |
+| Textures | TEX decoding and basic display for observed raw/GDeflate data and paired streaming resources | Volume preview uses the first slice; unobserved layouts or codecs may be rejected |
+| Animation | Select, bind, and play compatible MOTLIST actions on a model, including multiple actions and cross-file queues; three observed translation encodings are now supported | All 155 unique actions (179 entries) in two natural motion files pass decoding and host binding. Other actions and model pairings have not been comprehensively tested. Standalone opening of `.motlist.992` is not supported |
 
-The frozen MESH scope includes ordinary, multi-material, multi-LOD, one paired streaming profile, and one paired MPLY profile. Candidate 002 has geometry/materialized GUI evidence, and multi-LOD has geometry GUI evidence. Player/face now have skeleton-overlay and deterministic diagnostic-pose evidence, but that validates only the observed 12-slot weight influence; it is not full character shading or usable shape keys. Natural-animation binding has separate RE-086 evidence below. Paired streaming/MPLY subsets without independent GUI evidence are not automatically promoted to `previewable` merely because the parser can read them.
+Applicable file versions: `.mesh.241111606`, `.mdf2.45`, `.tex.241106027`, and `.motlist.992`. Preserve the extracted `natives/stm` and `streaming` directory structure. Models, materials, and textures should come from the same build; renaming an older texture suffix does not convert its format.
 
-TEX breadth evidence covers a structural inventory of 22,346 observed `.tex.251111100` files. Real Noesis runs covered 15 observed DXGI formats plus representative array, cube, and volume files. Only the original exact BC7 profile has an independent pixel-by-pixel oracle; the rest prove an operational representative decode/export path, not pixel-exact coverage for every TEX.
+Character material lookup now includes a constrained fallback for MDF files shared between male and female variants. Explicit MDF45 primary color and normal slots take priority over detail or damage textures. Vertex colors on character paths are treated as shader masks and are no longer multiplied into preview colors. The parser retains the raw data, but the resulting Noesis models and subsequent standard-format exports omit that vertex color stream. Dark eyes, white FakeAO helper surfaces, and some skin-color differences remain known limitations of the basic preview.
 
-### Player/face evidence limits
+Foliage edges use explicit material alpha-test flags together with an actual mask slot. Solid foliage on the simplified tree does not establish individual-leaf fidelity. Vegetation requiring a new `.stmesh` / STM8 reader is excluded from this delivery, including an identified grass/reed-like example; this does not imply that all grass uses that format.
 
-- `playergame_mat.mdf2.51`: 14 materials, 206 texture references, and 1,380 properties; headless Noesis created 14 materials and decoded 25 physical TEX files.
-- `ch0000_10_mat.mdf2.51`: 6 materials, 51 texture references, and 420 properties; headless Noesis created 6 materials and decoded 8 physical TEX files.
-- Material completion means parity with alphazolam's basic texture mapping, not reconstruction of the proprietary PRAGMATA shader. `BaseColor`, albedo-to-diffuse, normal/roughness-to-normal, and basic emissive routing are covered; the GUI reports player `14/25` and face `6/8` Materials/Textures, so this basic material scope is complete. The face iris, unverified packed channels, and master-shader fidelity remain additional coverage debt and do not block that basic claim.
-- All 91 observed `ch0000_10` shapes have finite deltas, nonzero statistics, and constructed morph frames. Real Noesis shows numeric frames 4/18, but source-named selection/toggleable shape-key behavior is still unverified, so deformation as a whole is not claimed as `previewable`.
-- The observed `ch0100_10` encoding `2` is accepted only for the frozen exact profile with `padding1=1`, submesh reserved `0x100`, and `4 × binary16` records (XYZ plus zero padding). An independent raw-byte oracle and the production parser both verify 107 × 10,982 finite deltas and payload SHA-256 `b9a53224...d5bb6`; real Noesis imports the model and constructs 107 source-named morph frames on the target submesh. This CLI evidence makes that exact profile scoped `readable`, not `previewable`: no GUI toggle evidence exists, and no other encoding or metadata layout is implied.
-- The primary+extra 12-slot weight storage and bone-name mapping were checked independently. The observed maxima are 8 nonzero influences for playergame and 9 for face. Real Noesis skeleton overlays and independent pose OBJs validate 6,148 changed player vertices for `L_UpperArm_Twist_2` and 1,871 changed face vertices for `C_Jaw`, both with 0 escaped and no wrong-side mirroring, origin spikes, or explosions. This is a deterministic source-X translation influence diagnostic, not a claim for natural animation, MOTLIST, export, independent re-import, or game runtime.
+64-bit Noesis is recommended. Open a model and use the existing animation selection window to load actions; unsupported actions are explicitly rejected. In-game shaders, procedural IK, MTRE semantics, native file writing, and in-game validation are outside current support. Noesis conversion to standard formats is separate from native game-file writing; Maya animation export has not been validated.
+
+## PRAGMATA: available features
+
+Model, basic material, texture, and skeletal animation import and preview are implemented. Textures have large-scale structural validation; models, materials, and animations have representative-sample validation. Game-wide compatibility coverage has not been measured, and some models or actions may still fail to load.
+
+| Feature | Available behavior | Validation and limits |
+| --- | --- | --- |
+| Models and skeletons | Import geometry, skeletons, and weights; observed multi-material, multi-LOD, single/dual-data-segment streaming and some MPLY layouts; representative previews cover the player, handheld/worn equipment, humanoid/nonhuman characters, a building scene, small props, trees, and low foliage | 83 of 96 fixed models import geometry (82 with basic textures and 1 legitimate textureless outline); 13 remain rejected. Other layouts, game-wide coverage, and per-model visual checks are incomplete |
+| Basic materials | Shared lookup and basic color, normal/roughness, alpha-test, and emission display; all 13,032 MDF files in the available extraction pass parsing | Parsing is not full effect reproduction. Eyes may be white, some regions dark, and nonzero emission pure white. Layered surfaces, decals, and glass in large scenes may look black/white or spotted; complex blending is incomplete |
+| Textures | raw/GDeflate decoding, array layers and cubemap faces, optional mip loading | 22,346 files in the available extraction passed structural parsing; representatives of 15 pixel formats plus arrays, cubes, and volumes passed Noesis conversion. This is not per-file pixel or visual validation; volume preview uses the first slice |
+| Skeletal animation | Standalone skeleton preview, mesh binding, action selection, and cross-file queues | Tested on one single-action sample, 24 motion-bearing files in the player directory, and representative player-model bindings. Other characters, motion layouts, and model/action pairings have not been comprehensively validated |
+| Morphs | Numeric-frame preview on some models | Source-named morph selection is not provided; not every facial model has been tested |
+
+Applicable file versions: `.mesh.251121828`, `.mdf2.51`, `.tex.251111100`, and `.motlist.1057` (MOT 993). A matching suffix does not guarantee compatibility; game updates may also change the layout.
+
+Vegetation requiring new `.stmesh` / STM8 support is excluded, including identified grass-blade, flowering-herb, and fern examples. Ordinary MESH/MPLY trees, low foliage, and leaf litter have previews; other unconfirmed live grass is neither claimed as supported nor declared absent. Fixed batch successes indicate actual parsing/loading, not individual visual acceptance of every file.
+
+### Open models and play animations
+
+- Preserve the extracted directory structure and companion files. For streaming models, open the main mesh and keep its streaming companion available; do not open headerless streaming data on its own.
+- Open a MOTLIST directly to preview its own skeleton, or load actions onto a model.
+- To bind animations: open a MESH → `Select Animations` → select a MOTLIST (a full path can be pasted) → double-click an action or `[ALL]` to queue it → click `Load` to return → click `Load` in the model dialog.
+- This uses the same shared animation selection dialog as DD2. Queue actions from multiple files; cancelling and reopening retains the directory and queue.
+- Tracks for bones absent from the model are skipped and counted. Binding is rejected when no tracks match or a known parent-space conflict exists. Arbitrary models and actions are not interchangeable.
+- `Force Center`, `Sync by Frame Count`, and `Force Merge All` are unavailable and disabled for PRAGMATA; the existing DD2 options remain available.
+
+### Known limitations
+
+- Basic material display is complete; full game shaders are not reproduced. Reading a material parameter does not mean its effect is rendered.
+- Common mapping may choose a different primary texture, including a damage texture. The face EyeShell OBJ/MTL texture path may differ from the generated PNG filename and require manual correction. Exported materials are not guaranteed to work directly in UE.
+- MTRE animation data is not supported; MTRE-only files cannot be loaded as skeletal actions.
+- Repeatedly reloading large MOTLIST files in 32-bit Noesis can run out of memory. This also occurs in the older version and remains unfixed. Repeated reloads of the same large sample have not been verified in 64-bit Noesis, so switching architectures is not a guaranteed fix.
+- Native PRAGMATA MESH/TEX/MOTLIST writing, independent re-import, and in-game validation workflows are not provided. The plugin does not produce files validated for writing back into the game.
+- This does not prevent Noesis from converting imported content to standard formats such as FBX, OBJ, PNG, or TGA. Preservation of skeletons, animations, and morphs depends on the exporter and its options; not every conversion combination has been tested.
 
 ## Install the Noesis plugin
 
-1. Download and install Noesis from the [official Noesis page](https://www.richwhitehouse.com/index.php?content=inc_projects.php&showproject=91).
-2. Copy `fmt_RE_MESH.py` and all root-level `re_engine_*.py` files into `[Noesis installation]/plugins/python/`, keeping all 20 Python runtime files in the same directory. Update the complete module set from the same revision.
-3. For 32-bit `Noesis.exe`, place `pragmata_gdeflate_x86.dll` in the same `plugins/python/` directory. For 64-bit `Noesis64.exe`, place `pragmata_gdeflate_x64.dll` there.
-4. Both DLLs may coexist. The plugin selects one from the current process pointer size and will not load an x86 DLL into an x64 process or vice versa.
-5. Restart Noesis and open a supported `.mesh.*`, `.tex.*`, or frozen exact-profile `.motlist.1057` file.
+1. Download and install Noesis from the [official Noesis page](https://www.richwhitehouse.com/index.php?content=inc_projects&showproject=91).
+2. Copy `fmt_RE_MESH.py` and all root-level `re_engine_*.py` files into `[Noesis installation]/plugins/python/`, for a total of 21 Python runtime files. Replace the whole module set when updating; do not mix versions.
+3. For 32-bit `Noesis.exe`, put `pragmata_gdeflate_x86.dll` in the same `plugins/python/` directory. For 64-bit `Noesis64.exe`, use `pragmata_gdeflate_x64.dll`.
+4. Both DLLs may coexist; the plugin selects by the running Noesis process architecture. Restart Noesis, then open a model, texture, or motion file.
 
-Without a matching DLL, uncompressed TEX profiles may still work, but TEX files that require GDeflate fail explicitly with `gdeflate-helper-missing:pragmata_gdeflate_x86.dll` or `gdeflate-helper-missing:pragmata_gdeflate_x64.dll`. There is no silent fallback that displays incorrect pixels. Fixed DLL hashes, PE architecture, ABI, source provenance, and license details are in [`tools/pragmata_gdeflate/README.md`](./tools/pragmata_gdeflate/README.md).
+Both games use this same plugin set; separate installations are unnecessary. To preview materials, enable `Load Textures` in the model loading dialog before clicking `Load`. With this option disabled, only the model is loaded.
 
-### MOTLIST exact-profile boundary
+For cutout foliage, set `Tools → Data Viewer → Persistent settings → View → Render opacity mask` to `1` and keep shading enabled (`F5` toggles it). Disabling shading may hide leaves. Wind and full game material effects are not provided. The plugin package contains no game assets; any additional resource root must preserve the corresponding `natives/stm` and `streaming` structure.
 
-RE-066 is complete for the frozen PRAGMATA MOTLIST v1057 / MOT v993 single-action, local-bone standalone exact profile: an independent oracle agrees on all 21 compressed tracks, and Noesis uses `NoeKeyFramedAnim` from the `NoeAnim` family to import and play the 9-bone, 7-animated-bone, 21-logical-track, 125-frame/60-FPS action.
-
-RE-068 additionally verifies 24 observed multi-action/shared-bones profiles, including observed dense/sparse/mixed entries and shared skeleton layouts. These standalone profiles are scoped `readable` / `previewable` and reuse the same shared animation selection dialog as DD2, including file switching, action selection, and queued loading.
-
-PRAGMATA supports both standalone MOTLIST skeleton preview and animation binding through the MESH `Select Animations` entry point. Use the shared DD2 dialog: open a mesh, click `Select Animations`, select a MOTLIST (or paste its full path), double-click actions or `[ALL]` to queue them, click `Load` to return, then click `Load` in the mesh window. Actions can be queued across files; cancelling and reopening preserves the directory and queue.
-
-RE-086 validates real Noesis playback on the player mesh with all 3 develop actions and 1 general action queued across files, preserving the model's 229 bones and original weights. The develop/general/damage files also pass adapter-level numeric mapping checks; this does not validate every character pairing. Tracks map to mesh bones by name hash. Unmatched tracks are skipped and counted; no matching tracks or a known parent-space conflict produces an explicit error. `Force Center`, `Sync by Frame Count`, and `Force Merge All` are not implemented for the PRAGMATA path and are disabled there. DD2 retains its existing options.
-
-This scope does not cover other v1057 layouts outside the observed matrix, MTRE semantics, the 5 MTRE-only files, MOTLIST export, independent re-import, or game runtime. It does not imply support for every `.motlist.1057` file.
-
-## Explicitly unsupported PRAGMATA scope
-
-- General PRAGMATA MESH/TEX writing is not supported and is excluded from the support targets. This means writing native game `.mesh.*` / `.tex.*` files. Candidate 002 has only an experimental, single-sample, source-template exact writer implementation; it is neither general export nor a supported write-back feature.
-- This exclusion does not refer to converting loaded models or textures to standard formats such as FBX, OBJ, PNG, or TGA using Noesis exporters. Preservation of skeletons, animations, or morphs depends on the exporter and its options; not every combination has been validated.
-- Independent re-import is not provided. The two upstream MaxScripts only perform a 3ds Max FBX → Noesis FBX merge → FBX return trip and do not read PRAGMATA MESH writer output.
-- Game runtime has not been validated. Writer output is not claimed to be accepted by the game or an official tool.
-- Proprietary master shaders, unverified packed channels, patch-only profiles, other builds, and every file sharing a suffix are not guaranteed.
+If the log reports `gdeflate-helper-missing`, check that the matching DLL is in the directory above. Uncompressed textures do not need this helper; GDeflate-compressed textures do. See the [GDeflate notes](./tools/pragmata_gdeflate/README.md) for component details and licenses.
 
 ## Maya animation workflow
 
@@ -89,11 +104,11 @@ This scope does not cover other v1057 layouts outside the observed matrix, MTRE 
 3. In REEM, select the Noesis executable and a `.mesh.*` or `.motlist.*` file.
 4. For MOTLIST files supported by upstream, double-click `[ALL]` in the Noesis selector, load, and export clips.
 
-This general Maya workflow does not broaden the RE-066/RE-068 standalone profiles above. The PRAGMATA Maya animation export workflow has not been validated; Noesis mesh-bound playback evidence does not validate Maya export. Out-of-scope layouts, native MOTLIST export, independent re-import, and runtime remain unavailable.
+The PRAGMATA Maya animation export workflow has not been validated. Successful binding and playback in Noesis do not validate the exported Maya result.
 
 ## Sources and notice
 
 - Noesis plugin source: [alphazolam/fmt_RE_MESH-Noesis-Plugin](https://github.com/alphazolam/fmt_RE_MESH-Noesis-Plugin)
 - Original Maya repository: [AtomAntzzz/RE-Engine-Mesh-Animtion-Noesis-Tool](https://github.com/AtomAntzzz/RE-Engine-Mesh-Animtion-Noesis-Tool)
 
-See [NOTICE.md](./NOTICE.md) for source attribution, merged history, third-party GDeflate components, and rights information. No PRAGMATA commercial samples, filename lists, extraction manifests, logs, screenshots, or test evidence artifacts are distributed here.
+See [NOTICE.md](./NOTICE.md) for source attribution, merged history, third-party GDeflate components, and rights information. Commercial samples, complete filename lists, extraction manifests, logs, and screenshots are not distributed here.

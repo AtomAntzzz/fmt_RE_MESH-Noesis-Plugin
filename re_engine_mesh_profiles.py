@@ -10,6 +10,8 @@ from re_engine_config import (
 	PRAGMATA_MESH_RANGE_LABELS,
 	PRAGMATA_MPLY_250707828,
 	PRAGMATA_MPLY_VERTEX_FLAGS,
+	WILDS_240704828,
+	WILDS_MPLY_240704828,
 )
 from re_engine_types import (
 	MeshProfileError,
@@ -29,6 +31,50 @@ def _detectPragmataIdentity(data, path):
 	if struct.unpack_from("<I", data, 8)[0] != len(data):
 		raise MeshProfileError("declared-size-mismatch")
 	return PRAGMATA_MPLY_250707828 if magic == b"MPLY" else PRAGMATA_250707828
+
+def detectWildsMeshIdentity(data, path):
+	if not path.lower().endswith(".mesh.241111606"):
+		return None
+	_checkedRange(data, 0, 176, "wilds-header")
+	magic = data[:4]
+	if magic not in (b"MESH", b"MPLY"):
+		raise MeshProfileError("mesh-magic-mismatch")
+	if _readMeshScalar(data, 4, "<I", "version") != 240704828:
+		raise MeshProfileError("internal-version-mismatch")
+	if _readMeshScalar(data, 8, "<I", "size") != len(data):
+		raise MeshProfileError("declared-size-mismatch")
+	return WILDS_MPLY_240704828 if magic == b"MPLY" else WILDS_240704828
+
+def parseWildsMeshHeader(data, path):
+	capability = detectWildsMeshIdentity(data, path)
+	if capability != WILDS_240704828:
+		raise MeshProfileError("unsupported-mesh-profile")
+	header = {"capability": capability,
+		"name_count": _readMeshScalar(data, 20, "<H", "name-count")}
+	for name, offset in (("vertices_offset", 40), ("lod_offset", 48),
+			("blend_shape_offset", 80), ("mesh_offset", 88),
+			("skeleton_offset", 120), ("material_remap_offset", 128),
+			("bone_remap_offset", 136), ("blend_name_offset", 144),
+			("names_offset", 152), ("streaming_offset", 160)):
+		value = _readMeshScalar(data, offset, "<Q", name)
+		if value and (value < 176 or value >= len(data)):
+			raise MeshProfileError("offset-out-of-bounds:" + name)
+		header[name] = value
+	for name in ("vertices_offset", "lod_offset", "mesh_offset",
+			"material_remap_offset", "names_offset", "streaming_offset"):
+		if not header[name]:
+			raise MeshProfileError("offset-out-of-bounds:" + name)
+	if not header["name_count"]:
+		raise MeshProfileError("structural-profile-mismatch:name-count")
+	_checkedRange(data, header["streaming_offset"], 16, "streaming-info")
+	count, unknown, entries = struct.unpack_from("<IIQ", data, header["streaming_offset"])
+	if count > 7 or unknown != 0:
+		raise MeshProfileError("unsupported-streaming-entry-count")
+	if count:
+		_checkedRange(data, entries, count * 8, "streaming-entries")
+	header["streaming_entry_count"] = count
+	header["streaming_entries_offset"] = entries
+	return header
 
 def _readMeshScalar(data, offset, fmt, label):
 	return re_common.read_scalar(data, offset, fmt, label, MeshProfileError)
@@ -182,7 +228,12 @@ def parsePragmataMeshBufferHeader(data, mesh_offset, streaming_offset=None,
 			raise MeshProfileError(
 				"structural-profile-mismatch:streaming-vertex-element-offset")
 	elif vertex_element_offset != mesh_offset + 96:
-		raise MeshProfileError("structural-profile-mismatch:vertex-elements-96")
+		# Some unstreamed files retain an empty 16-byte streaming-info record.
+		if (vertex_element_offset != mesh_offset + 112 or
+				streaming_offset != mesh_offset + 96 or
+				bytes(data[mesh_offset + 96:mesh_offset + 112]) != bytes(16)):
+			raise MeshProfileError("structural-profile-mismatch:vertex-elements-96")
+		mesh_range = _checkedRange(data, mesh_offset, 112, "mesh-header")
 	for label, value in (("mesh-extra-0", extra_offset0), ("mesh-extra-1", extra_offset1)):
 		if value != 0 and value >= len(data):
 			raise MeshProfileError("offset-out-of-bounds:" + label)
@@ -536,12 +587,20 @@ def parsePragmataHeader(data, path):
 		raise MeshProfileError("structural-profile-mismatch:name-count")
 	for label, offset in PRAGMATA_HEADER_FIELDS:
 		value = _readMeshScalar(data, offset, "<Q", label)
-		if label in ("blend_shape_offset", "blend_name_offset"):
+		if label in ("blend_shape_offset", "blend_name_offset", "aabb_offset",
+				"skeleton_offset", "bone_remap_offset"):
 			if value >= len(data):
 				raise MeshProfileError("offset-out-of-bounds:" + label)
 		elif value <= 0 or value >= len(data):
 			raise MeshProfileError("offset-out-of-bounds:" + label)
 		header[label] = value
+	if header["skeleton_offset"]:
+		for label in ("bone_remap_offset", "aabb_offset"):
+			if not header[label]:
+				raise MeshProfileError("offset-out-of-bounds:" + label)
+	elif any(header[label] for label in (
+			"bone_remap_offset", "aabb_offset", "blend_shape_offset", "blend_name_offset")):
+		raise MeshProfileError("structural-profile-mismatch:static-skeleton-offsets")
 	if bool(header["blend_shape_offset"]) != bool(header["blend_name_offset"]):
 		raise MeshProfileError("structural-profile-mismatch:blend-shape-offset-pair")
 	header["blend_shape"] = (
@@ -579,7 +638,7 @@ def parsePragmataMplyHeader(data, path):
 			("streaming", 0xA0),
 			("sdf-path", 0xA8)):
 		value = _readMeshScalar(data, offset, "<Q", label)
-		if value <= 0 or value >= len(data):
+		if (value == 0 and label != "sdf-path") or value >= len(data):
 			raise MeshProfileError("offset-out-of-bounds:" + label)
 		pointers[label] = value
 	_checkedRange(data, pointers["names"], name_count * 8, "name-table")
@@ -606,6 +665,12 @@ def parsePragmataMplyHeader(data, path):
 	if (any(not math.isfinite(value) for value in bvh_offset) or
 			not math.isfinite(bvh_scale) or bvh_scale <= 0.0):
 		raise MeshProfileError("structural-profile-mismatch:meshlet-bvh-transform")
+	# Observed newer clusters store per-LOD count/flags and independent offsets.
+	# Their 4/8-unit quantization families share the bounded packed decoder.
+	if bvh_scale in (3.99993896484375, 7.9998779296875):
+		result = _parsePackedMplyHeader(data, capability)
+		result["packed_mply_layout"] = True
+		return result
 	if abs((bvh_scale + (1.0 / 2048.0)) - 32.0) > 1.0e-7:
 		raise MeshProfileError("unsupported-meshlet-quantization-scale")
 	cluster_counts = list(struct.unpack_from("<8I", data, meshlet_bvh + 32))
@@ -635,6 +700,89 @@ def parsePragmataMplyHeader(data, path):
 		"lod_count": lod_count,
 		"lod_offsets": lod_offsets[:lod_count],
 		"cluster_counts": cluster_counts[:lod_count],
+		"cluster_headers_offset": cluster_headers_offset,
+		"quantize_centers_offset": quantize_centers_offset,
+		"bvh_offset": bvh_offset,
+		"bvh_scale": bvh_scale,
+		"streaming_start": streaming_start,
+		"streaming_size": streaming_size,
+	}
+
+def parseWildsMplyHeader(data, path):
+	"""Read the bounded Wilds MPLY tables needed by the cluster decoder."""
+	capability = detectWildsMeshIdentity(data, path)
+	if capability != WILDS_MPLY_240704828:
+		raise MeshProfileError("unsupported-mesh-profile")
+	return _parsePackedMplyHeader(data, capability)
+
+
+def _parsePackedMplyHeader(data, capability):
+	name_count = _readMeshScalar(data, 0x14, "<H", "name-count")
+	if name_count <= 0:
+		raise MeshProfileError("structural-profile-mismatch:name-count")
+	pointers = {}
+	for label, offset in (
+			("gpu-meshlet", 0x28), ("meshlet-layout", 0x38),
+			("meshlet-bvh", 0x40), ("meshlet-parts", 0x48),
+			("material-remap", 0x80), ("names", 0x98),
+			("streaming", 0xA0)):
+		value = _readMeshScalar(data, offset, "<Q", label)
+		if value <= 0 or value >= len(data):
+			raise MeshProfileError("offset-out-of-bounds:" + label)
+		pointers[label] = value
+	_checkedRange(data, pointers["names"], name_count * 8, "name-table")
+
+	layout = pointers["meshlet-layout"]
+	_checkedRange(data, layout, 160, "meshlet-layout")
+	if _readMeshScalar(data, layout, "<Q", "layout-gpu-meshlet") != pointers["gpu-meshlet"]:
+		raise MeshProfileError("structural-profile-mismatch:gpu-meshlet-offset")
+	lod_count = _readMeshScalar(data, layout + 20, "<B", "lod-count")
+	if not 1 <= lod_count <= 8:
+		raise MeshProfileError("structural-profile-mismatch:lod-count")
+	lod_offsets = list(struct.unpack_from("<8I", data, layout + 40))
+	if any(offset <= 0 for offset in lod_offsets[:lod_count]):
+		raise MeshProfileError("structural-profile-mismatch:lod-cluster-offset")
+	if any(lod_offsets[lod_count:]):
+		raise MeshProfileError("structural-profile-mismatch:unused-lod-cluster-offset")
+
+	bvh = pointers["meshlet-bvh"]
+	_checkedRange(data, bvh, 128, "meshlet-bvh")
+	cluster_headers_offset, quantize_centers_offset = struct.unpack_from("<QQ", data, bvh)
+	bvh_offset = struct.unpack_from("<3f", data, bvh + 16)
+	bvh_scale = _readMeshScalar(data, bvh + 28, "<f", "meshlet-bvh-scale")
+	if (any(not math.isfinite(value) for value in bvh_offset) or
+			not math.isfinite(bvh_scale) or bvh_scale <= 0.0):
+		raise MeshProfileError("structural-profile-mismatch:meshlet-bvh-transform")
+	cluster_counts = []
+	for index in range(8):
+		count, _unknown0, _unknown1 = struct.unpack_from("<HBB", data, bvh + 32 + index * 4)
+		cluster_counts.append(count)
+	if any(count <= 0 for count in cluster_counts[:lod_count]) or any(cluster_counts[lod_count:]):
+		raise MeshProfileError("structural-profile-mismatch:cluster-count")
+	cluster_offsets = list(struct.unpack_from("<8I", data, bvh + 64))
+	for index in range(lod_count):
+		_checkedRange(data, cluster_headers_offset + cluster_offsets[index],
+			cluster_counts[index] * 16, "cluster-headers")
+	_checkedRange(data, quantize_centers_offset, sum(cluster_counts) * 6,
+		"quantize-centers")
+
+	streaming_count, streaming_unknown, streaming_entry_offset = struct.unpack_from(
+		"<IIQ", data, pointers["streaming"])
+	if streaming_count != 1 or streaming_unknown != 0:
+		raise MeshProfileError("unsupported-streaming-entry-count")
+	_checkedRange(data, streaming_entry_offset, 8, "streaming-info-entry")
+	streaming_start, streaming_size = struct.unpack_from("<II", data, streaming_entry_offset)
+	if streaming_size <= 0:
+		raise MeshProfileError("structural-profile-mismatch:streaming-buffer-size")
+	return {
+		"capability": capability,
+		"name_count": name_count,
+		"names_offset": pointers["names"],
+		"gpu_meshlet_offset": pointers["gpu-meshlet"],
+		"lod_count": lod_count,
+		"lod_offsets": lod_offsets[:lod_count],
+		"cluster_counts": cluster_counts[:lod_count],
+		"cluster_offsets": cluster_offsets[:lod_count],
 		"cluster_headers_offset": cluster_headers_offset,
 		"quantize_centers_offset": quantize_centers_offset,
 		"bvh_offset": bvh_offset,
@@ -682,6 +830,39 @@ def _decodePragmataMplyPositions(position_data, vertex_count, flags, center, sca
 	for offset in offsets:
 		position = tuple(center[axis] + offset[axis] for axis in range(3))
 		if any(not math.isfinite(coordinate) for coordinate in position):
+			raise MeshProfileError("structural-profile-mismatch:non-finite-position")
+		positions.append(position)
+	return positions
+
+def _decodeWildsMplyPositions(position_data, vertex_count, flags, part_center,
+		bbox_center):
+	"""Decode the observed Wilds 16-bit and 10:10:10 position layouts."""
+	if flags & 0x2000:
+		raise MeshProfileError("unsupported-meshlet-24bit-position-layout")
+	stride = 4 if flags & 0x1000 else 6
+	_checkedRange(position_data, 0, vertex_count * stride, "meshlet-position-buffer")
+	div_byte = (flags >> 24) & 0xFF
+	mult_byte = (flags >> 16) & 0xFF
+	scale = math.ldexp(1.0, div_byte - 127)
+	relative_scale = math.ldexp(1.0, mult_byte - div_byte)
+	relative = tuple(value / 65535.0 - 0.5 for value in bbox_center)
+	positions = []
+	for index in range(vertex_count):
+		if stride == 4:
+			packed = struct.unpack_from("<I", position_data, index * 4)[0]
+			raw = (packed & 0x3FF, (packed >> 10) & 0x3FF,
+				(packed >> 20) & 0x3FF)
+		else:
+			raw = tuple(
+				_meshFloat32(_meshFloat32(value) / _meshFloat32(65535.0))
+				for value in struct.unpack_from("<3H", position_data, index * 6))
+		centered = tuple(
+			_meshFloat32(raw[axis] - _meshFloat32(0.5))
+			if stride == 6 else raw[axis] - 0.5 for axis in range(3))
+		position = tuple(
+			(centered[axis] + relative[axis] * relative_scale) * scale +
+			part_center[axis] for axis in range(3))
+		if any(not math.isfinite(value) for value in position):
 			raise MeshProfileError("structural-profile-mismatch:non-finite-position")
 		positions.append(position)
 	return positions
@@ -754,6 +935,8 @@ def _newPragmataImportStats(capability):
 def _parsePragmataMplyData(data, header, streaming_data=None):
 	if header.get("capability") != PRAGMATA_MPLY_250707828:
 		raise MeshProfileError("unsupported-mesh-profile")
+	if header.get("packed_mply_layout"):
+		return _parsePackedMplyData(data, header, streaming_data)
 	if streaming_data is None:
 		raise MeshProfileError("missing-streaming-companion")
 	streaming_start = header["streaming_start"]
@@ -927,6 +1110,199 @@ def _parsePragmataMplyData(data, header, streaming_data=None):
 		"material_names": material_names,
 	}
 
+def parseWildsMplyData(data, header, streaming_data=None):
+	"""Normalize observed Wilds MPLY clusters for shared Noesis submission."""
+	if header.get("capability") != WILDS_MPLY_240704828:
+		raise MeshProfileError("unsupported-mesh-profile")
+	return _parsePackedMplyData(data, header, streaming_data)
+
+
+def _parsePackedMplyData(data, header, streaming_data=None):
+	if streaming_data is None:
+		raise MeshProfileError("missing-streaming-companion")
+	streaming_start = header["streaming_start"]
+	streaming_size = header["streaming_size"]
+	_checkedRange(streaming_data, streaming_start, streaming_size, "streaming-buffer")
+	if streaming_start + streaming_size != len(streaming_data):
+		raise MeshProfileError("structural-profile-mismatch:streaming-buffer-size")
+
+	material_names = []
+	for index in range(header["name_count"]):
+		name_offset = _readMeshScalar(
+			data, header["names_offset"] + index * 8, "<Q", "material-name-pointer")
+		name = _readPragmataCString(data, name_offset, "material-name")
+		if not name:
+			raise MeshProfileError("structural-profile-mismatch:empty-material-name")
+		material_names.append(name)
+
+	positions, indices = [], []
+	normal_parts, uv_parts, color_parts = [], [], []
+	submeshes, groups = [], []
+	has_color = False
+	tangent_count = 0
+	cluster_global_index = 0
+	gpu_base = header["gpu_meshlet_offset"]
+	for lod_index in range(header["lod_count"]):
+		cluster_count = header["cluster_counts"][lod_index]
+		lod_table_offset = gpu_base + header["lod_offsets"][lod_index]
+		_checkedRange(data, lod_table_offset, 4 + cluster_count * 4, "meshlet-lod-table")
+		if _readMeshScalar(data, lod_table_offset, "<I", "meshlet-lod-count") != cluster_count:
+			raise MeshProfileError("structural-profile-mismatch:cluster-count")
+		entry_offsets = struct.unpack_from(
+			"<" + "I" * cluster_count, data, lod_table_offset + 4)
+		lod_vertex_start, lod_index_start = len(positions), len(indices)
+		for cluster_index, entry_relative in enumerate(entry_offsets):
+			compact_offset = (header["cluster_headers_offset"] +
+				header["cluster_offsets"][lod_index] + cluster_index * 16)
+			bitfield, vertex_relative, index_relative = struct.unpack_from(
+				"<QII", data, compact_offset)
+			vertex_count = bitfield & 0xFF
+			index_count = (bitfield >> 8) & 0x1FF
+			material_index = (bitfield >> 23) & 0xFF
+			if not 1 <= vertex_count <= 255:
+				raise MeshProfileError("structural-profile-mismatch:meshlet-vertex-count")
+			if index_count <= 0 or index_count % 3:
+				raise MeshProfileError("structural-profile-mismatch:index-count")
+			if material_index >= len(material_names):
+				raise MeshProfileError("structural-profile-mismatch:material-index")
+
+			entry_offset = gpu_base + entry_relative
+			_checkedRange(data, entry_offset, 32 + index_count, "meshlet-cluster-entry")
+			part_center = struct.unpack_from("<3f", data, entry_offset)
+			if any(not math.isfinite(value) for value in part_center):
+				raise MeshProfileError("structural-profile-mismatch:meshlet-part-center")
+			entry_vertex_count, face_count, entry_material, _part_index = \
+				struct.unpack_from("<4B", data, entry_offset + 12)
+			if (entry_vertex_count != vertex_count or face_count * 3 != index_count or
+					entry_material != material_index):
+				raise MeshProfileError("structural-profile-mismatch:meshlet-entry-count")
+			bbox_values = struct.unpack_from("<6H", data, entry_offset + 16)
+			bbox_center = (bbox_values[0], bbox_values[2], bbox_values[4])
+			flags = _readMeshScalar(data, entry_offset + 28, "<I", "meshlet-flags")
+			if flags & 0x800:
+				raise MeshProfileError("unsupported-meshlet-skin-layout")
+			embedded_indices = list(
+				data[entry_offset + 32:entry_offset + 32 + index_count])
+			if any(index >= vertex_count for index in embedded_indices):
+				raise MeshProfileError("index-out-of-range")
+
+			stream_index_offset = streaming_start + index_relative
+			_checkedRange(streaming_data, stream_index_offset, index_count * 2,
+				"streaming-index-buffer")
+			stream_indices = list(struct.unpack_from(
+				"<" + "H" * index_count, streaming_data, stream_index_offset))
+			if stream_indices != embedded_indices:
+				raise MeshProfileError("streaming-index-copy-mismatch")
+
+			position_stride = 3 if flags & 0x2000 else 4 if flags & 0x1000 else 6
+			position_offset = gpu_base + vertex_relative
+			position_size = position_stride * vertex_count
+			_checkedRange(data, position_offset, position_size, "meshlet-position-buffer")
+			cluster_positions = _decodeWildsMplyPositions(
+				bytes(data[position_offset:position_offset + position_size]),
+				vertex_count, flags, part_center, bbox_center)
+			cursor = (position_offset + position_size + 3) & ~3
+			normal_stride = 4 if flags & 0x40 else 8
+			normal_size = normal_stride if flags & 0x1 else vertex_count * normal_stride
+			_checkedRange(data, cursor, normal_size, "meshlet-normal-buffer")
+			raw_normals = bytes(data[cursor:cursor + normal_size])
+			if flags & 0x1:
+				raw_normals *= vertex_count
+			if normal_stride == 4:
+				normal_parts.append(b"".join(
+					raw_normals[index:index + 4] + b"\0\0\0\x7f"
+					for index in range(0, len(raw_normals), 4)))
+			else:
+				normal_parts.append(raw_normals)
+				tangent_count += vertex_count
+			cursor += normal_size
+			# PRAGMATA's packed profile stores UVs directly after normals even
+			# when this flag is set; Wilds has the separate tangent bitset.
+			if flags & 0x8000 and not header.get("packed_mply_layout"):
+				tangent_bits_size = ((vertex_count + 31) // 32) * 4
+				_checkedRange(data, cursor, tangent_bits_size, "meshlet-tangent-bits")
+				cursor += tangent_bits_size
+			uv_size = vertex_count * 4
+			stored_uv_size = 4 if flags & 0x2 else uv_size
+			_checkedRange(data, cursor, stored_uv_size, "meshlet-uv-buffer")
+			raw_uv = bytes(data[cursor:cursor + stored_uv_size])
+			uv_parts.append(raw_uv * vertex_count if flags & 0x2 else raw_uv)
+			cursor += stored_uv_size
+			for use_flag, compressed_flag, label in (
+					(0x200, 0x4, "meshlet-uv2-buffer"),
+					(0x400, 0x8, "meshlet-uv3-buffer")):
+				if flags & use_flag:
+					stored_size = 4 if flags & compressed_flag else uv_size
+					_checkedRange(data, cursor, stored_size, label)
+					cursor += stored_size
+			if flags & 0x100:
+				stored_color_size = 4 if flags & 0x10 else uv_size
+				_checkedRange(data, cursor, stored_color_size, "meshlet-color-buffer")
+				raw_color = bytes(data[cursor:cursor + stored_color_size])
+				color_parts.append(
+					raw_color * vertex_count if flags & 0x10 else raw_color)
+				has_color = True
+			else:
+				color_parts.append(bytes((255, 255, 255, 255)) * vertex_count)
+
+			vertex_start = len(positions)
+			positions.extend(cluster_positions)
+			indices.extend(index + vertex_start for index in embedded_indices)
+			submeshes.append({
+				"lod_index": lod_index, "group_id": 0,
+				"submesh_index": cluster_index,
+				"material_index": material_index,
+				"vertex_start": vertex_start, "vertex_count": vertex_count,
+				"index_count": index_count, "indices": embedded_indices,
+				"index_buffer": struct.pack(
+					"<" + "H" * index_count, *embedded_indices),
+			})
+			cluster_global_index += 1
+		groups.append({
+			"lod_index": lod_index, "group_id": 0,
+			"submesh_count": cluster_count,
+			"vertex_count": len(positions) - lod_vertex_start,
+			"index_count": len(indices) - lod_index_start,
+		})
+
+	if cluster_global_index != sum(header["cluster_counts"]) or not positions:
+		raise MeshProfileError("structural-profile-mismatch:cluster-count")
+	position_buffer = b"".join(struct.pack("<3f", *position) for position in positions)
+	normal_buffer = b"".join(normal_parts)
+	uv_buffer = b"".join(uv_parts)
+	color_buffer = b"".join(color_parts)
+	vertex_buffer = position_buffer + normal_buffer + uv_buffer
+	vertex_elements = {
+		0: {"type": 0, "stride": 12, "offset": 0},
+		1: {"type": 1, "stride": 8, "offset": len(position_buffer)},
+		2: {"type": 2, "stride": 4,
+			"offset": len(position_buffer) + len(normal_buffer)},
+	}
+	if has_color:
+		vertex_elements[5] = {"type": 5, "stride": 4, "offset": len(vertex_buffer)}
+		vertex_buffer += color_buffer
+	mins = [min(position[axis] for position in positions) for axis in range(3)]
+	maxs = [max(position[axis] for position in positions) for axis in range(3)]
+	stats = _newPragmataImportStats(header["capability"])
+	stats.update({
+		"lod_count": header["lod_count"], "group_count": header["lod_count"],
+		"submesh_count": len(submeshes), "vertex_count": len(positions),
+		"index_count": len(indices), "triangle_count": len(indices) // 3,
+		"normal_count": len(positions), "tangent_count": tangent_count,
+		"uv_count": len(positions), "color_count": len(positions) if has_color else 0,
+		"material_binding_count": len(submeshes),
+		"aabb": {"min": mins, "max": maxs},
+		"topology_hash": _meshTopologyHash(positions, indices),
+	})
+	return {
+		"stats": stats, "positions": positions, "indices": indices,
+		"groups": groups, "submeshes": submeshes,
+		"vertex_buffer": vertex_buffer, "vertex_elements": vertex_elements,
+		"bone_indices": [], "bone_weights": [], "bone_map": [], "bones": [],
+		"material_names": material_names, "blend_shape_names": [],
+		"blend_shapes": [],
+	}
+
 def _pragmataMplyNoesisBatches(submeshes):
 	"""Collapse meshlets to one Noesis surface per LOD/material pair."""
 	batch_map = {}
@@ -958,7 +1334,7 @@ def _pragmataMplyNoesisBatches(submeshes):
 	return result
 
 def _pragmataNoesisIndexSubmission(submesh, capability):
-	if capability == PRAGMATA_MPLY_250707828:
+	if capability in (PRAGMATA_MPLY_250707828, WILDS_MPLY_240704828):
 		return submesh["index_buffer"], 4
 	indices = submesh.get("indices", [])
 	if len(indices) != submesh.get("index_count"):
@@ -970,6 +1346,66 @@ def _pragmataNoesisIndexSubmission(submesh, capability):
 	if 0xFFFF in indices:
 		return struct.pack("<%dI" % len(indices), *indices), 4
 	return submesh["index_buffer"], 2
+
+def _readProfileSkeleton(data, skeleton_offset, bone_name_remap_offset, names):
+	name_count = len(names)
+	_checkedRange(data, skeleton_offset, 48, "skeleton-header")
+	bone_count, bone_map_count = struct.unpack_from("<II", data, skeleton_offset)
+	if bone_count <= 0:
+		raise MeshProfileError("structural-profile-mismatch:bone-count")
+	_validatePragmataBoneMapCount(bone_map_count)
+	hierarchy_offset, local_offset, global_offset, inverse_global_offset = struct.unpack_from(
+		"<QQQQ", data, skeleton_offset + 16)
+	for label, offset, size in (
+		("bone-hierarchy", hierarchy_offset, bone_count * 16),
+		("bone-local-matrices", local_offset, bone_count * 64),
+		("bone-global-matrices", global_offset, bone_count * 64),
+		("bone-inverse-global-matrices", inverse_global_offset, bone_count * 64),
+	):
+		if offset <= 0:
+			raise MeshProfileError("offset-out-of-bounds:" + label)
+		_checkedRange(data, offset, size, label)
+
+	bone_map_offset = skeleton_offset + 48
+	_checkedRange(data, bone_map_offset, bone_map_count * 2, "bone-map")
+	bone_map = []
+	for map_index in range(bone_map_count):
+		bone_index = struct.unpack_from("<h", data, bone_map_offset + map_index * 2)[0]
+		if bone_index < 0 or bone_index >= bone_count:
+			raise MeshProfileError("bone-map-index-out-of-range")
+		bone_map.append(bone_index)
+
+	_checkedRange(data, bone_name_remap_offset, bone_count * 2, "bone-name-remap")
+	bone_name_indices = []
+	for bone_index in range(bone_count):
+		name_index = struct.unpack_from("<H", data, bone_name_remap_offset + bone_index * 2)[0]
+		if name_index >= name_count:
+			raise MeshProfileError("name-index-out-of-range:bone")
+		bone_name_indices.append(name_index)
+
+	bones = []
+	seen_bone_indices = set()
+	for bone_index in range(bone_count):
+		hierarchy = struct.unpack_from("<8h", data, hierarchy_offset + bone_index * 16)
+		declared_index = hierarchy[0]
+		parent_index = hierarchy[1]
+		if declared_index < 0 or declared_index >= bone_count or declared_index in seen_bone_indices:
+			raise MeshProfileError("bone-index-out-of-range")
+		if parent_index < -1 or parent_index >= bone_count:
+			raise MeshProfileError("bone-parent-index-out-of-range")
+		seen_bone_indices.add(declared_index)
+		matrix_offset = local_offset + bone_index * 64
+		matrix_values = struct.unpack_from("<16f", data, matrix_offset)
+		if any(not math.isfinite(value) for value in matrix_values):
+			raise MeshProfileError("structural-profile-mismatch:non-finite-bone-matrix")
+		bones.append({
+			"index": declared_index,
+			"parent_index": parent_index,
+			"name": names[bone_name_indices[bone_index]],
+			"local_matrix": bytes(data[matrix_offset:matrix_offset + 64]),
+		})
+
+	return bone_count, bone_map_count, bone_map, bones
 
 def _parsePragmataMeshData(data, header, streaming_data=None):
 	capability = header.get("capability")
@@ -989,8 +1425,11 @@ def _parsePragmataMeshData(data, header, streaming_data=None):
 		raise MeshProfileError("structural-profile-mismatch:material-count")
 	if count_array[6] != 0:
 		raise MeshProfileError("structural-profile-mismatch:index-width")
-	if streaming_entry_count not in (0, 1):
+	if streaming_entry_count not in (0, 1, 2):
 		raise MeshProfileError("unsupported-streaming-entry-count")
+	multi_stream = streaming_entry_count == 2
+	if multi_stream and header.get("blend_shape") is not None:
+		raise MeshProfileError("unsupported-multi-stream-blend-profile")
 	if streaming_entry_count and streaming_data is None:
 		raise MeshProfileError("missing-streaming-companion")
 	lod_table_offset = lod_offset + 64
@@ -999,6 +1438,10 @@ def _parsePragmataMeshData(data, header, streaming_data=None):
 	groups = []
 	submeshes = []
 	buffer_vertex_counts = {"main": 0, "streaming": 0}
+	buffer_order = ["streaming", "main"]
+	if multi_stream:
+		buffer_vertex_counts["streaming_1"] = 0
+		buffer_order = ["streaming", "streaming_1", "main"]
 	for lod_index in range(lod_count):
 		buffer_kind = "streaming" if lod_index < streaming_entry_count else "main"
 		lod_record_offset = struct.unpack_from("<Q", data, lod_table_offset + lod_index * 8)[0]
@@ -1023,13 +1466,20 @@ def _parsePragmataMeshData(data, header, streaming_data=None):
 			if group_index_count <= 0:
 				raise MeshProfileError("structural-profile-mismatch:index-count")
 			_checkedRange(data, group_offset + 16, submesh_count * 32, "submesh-table")
+			if multi_stream:
+				buffer_id = data[group_offset + 18]
+				if buffer_id > streaming_entry_count:
+					raise MeshProfileError("structural-profile-mismatch:streaming-buffer-id")
+				buffer_kind = ("main", "streaming", "streaming_1")[buffer_id]
 			local_group_vertex_start = buffer_vertex_counts[buffer_kind]
 			vertex_buffer_adjust = (
-				buffer_vertex_counts["streaming"] if buffer_kind == "main" else 0
+				buffer_vertex_counts["streaming"] if buffer_kind == "main" and not multi_stream else 0
 			)
 			group_vertex_start = local_group_vertex_start + vertex_buffer_adjust
 			group_submeshes = []
 			for submesh_index in range(submesh_count):
+				if multi_stream and data[group_offset + 18 + submesh_index * 32] != buffer_id:
+					raise MeshProfileError("structural-profile-mismatch:streaming-buffer-id")
 				submesh = parsePragmataSubmesh(data, group_offset + 16 + submesh_index * 32)
 				if submesh["streaming_offset"] != 0 or submesh["platform_streaming_offset"] != 0:
 					raise MeshProfileError("streaming-profile-out-of-scope")
@@ -1070,7 +1520,18 @@ def _parsePragmataMeshData(data, header, streaming_data=None):
 				"vertex_count": group_vertex_count,
 				"index_count": group_index_count,
 			})
+			if multi_stream:
+				groups[-1]["buffer_kind"] = buffer_kind
 			buffer_vertex_counts[buffer_kind] += group_vertex_count
+	if multi_stream:
+		if any(buffer_vertex_counts[kind] <= 0 for kind in buffer_order):
+			raise MeshProfileError("structural-profile-mismatch:empty-streaming-buffer")
+		base = 0
+		for kind in buffer_order:
+			for record in groups + submeshes:
+				if record["buffer_kind"] == kind:
+					record["vertex_start"] += base
+			base += buffer_vertex_counts[kind]
 
 	vertex_count = sum(group["vertex_count"] for group in groups)
 	index_count = sum(submesh["index_count"] for submesh in submeshes)
@@ -1097,41 +1558,12 @@ def _parsePragmataMeshData(data, header, streaming_data=None):
 			raise MeshProfileError("name-index-out-of-range:material")
 		material_names.append(names[name_index])
 
-	skeleton_offset = header["skeleton_offset"]
-	_checkedRange(data, skeleton_offset, 48, "skeleton-header")
-	bone_count, bone_map_count = struct.unpack_from("<II", data, skeleton_offset)
-	if bone_count <= 0:
-		raise MeshProfileError("structural-profile-mismatch:bone-count")
-	_validatePragmataBoneMapCount(bone_map_count)
-	hierarchy_offset, local_offset, global_offset, inverse_global_offset = struct.unpack_from(
-		"<QQQQ", data, skeleton_offset + 16)
-	for label, offset, size in (
-		("bone-hierarchy", hierarchy_offset, bone_count * 16),
-		("bone-local-matrices", local_offset, bone_count * 64),
-		("bone-global-matrices", global_offset, bone_count * 64),
-		("bone-inverse-global-matrices", inverse_global_offset, bone_count * 64),
-	):
-		if offset <= 0:
-			raise MeshProfileError("offset-out-of-bounds:" + label)
-		_checkedRange(data, offset, size, label)
-
-	bone_map_offset = skeleton_offset + 48
-	_checkedRange(data, bone_map_offset, bone_map_count * 2, "bone-map")
-	bone_map = []
-	for map_index in range(bone_map_count):
-		bone_index = struct.unpack_from("<h", data, bone_map_offset + map_index * 2)[0]
-		if bone_index < 0 or bone_index >= bone_count:
-			raise MeshProfileError("bone-map-index-out-of-range")
-		bone_map.append(bone_index)
-
-	bone_name_remap_offset = header["bone_remap_offset"]
-	_checkedRange(data, bone_name_remap_offset, bone_count * 2, "bone-name-remap")
-	bone_name_indices = []
-	for bone_index in range(bone_count):
-		name_index = struct.unpack_from("<H", data, bone_name_remap_offset + bone_index * 2)[0]
-		if name_index >= name_count:
-			raise MeshProfileError("name-index-out-of-range:bone")
-		bone_name_indices.append(name_index)
+	static_mesh = not header["skeleton_offset"]
+	if static_mesh:
+		bone_count, bone_map_count, bone_map, bones = 0, 0, [], []
+	else:
+		bone_count, bone_map_count, bone_map, bones = _readProfileSkeleton(
+			data, header["skeleton_offset"], header["bone_remap_offset"], names)
 
 	blend_shape_names = []
 	blend_shape = header.get("blend_shape")
@@ -1161,31 +1593,10 @@ def _parsePragmataMeshData(data, header, streaming_data=None):
 				raise MeshProfileError(
 					"structural-profile-mismatch:blend-submesh-vertex-range")
 
-	bones = []
-	seen_bone_indices = set()
-	for bone_index in range(bone_count):
-		hierarchy = struct.unpack_from("<8h", data, hierarchy_offset + bone_index * 16)
-		declared_index = hierarchy[0]
-		parent_index = hierarchy[1]
-		if declared_index < 0 or declared_index >= bone_count or declared_index in seen_bone_indices:
-			raise MeshProfileError("bone-index-out-of-range")
-		if parent_index < -1 or parent_index >= bone_count:
-			raise MeshProfileError("bone-parent-index-out-of-range")
-		seen_bone_indices.add(declared_index)
-		matrix_offset = local_offset + bone_index * 64
-		matrix_values = struct.unpack_from("<16f", data, matrix_offset)
-		if any(not math.isfinite(value) for value in matrix_values):
-			raise MeshProfileError("structural-profile-mismatch:non-finite-bone-matrix")
-		bones.append({
-			"index": declared_index,
-			"parent_index": parent_index,
-			"name": names[bone_name_indices[bone_index]],
-			"local_matrix": bytes(data[matrix_offset:matrix_offset + 64]),
-		})
-
 	mesh_buffer = header["mesh_buffer"]
+	minimum_elements = 4 if static_mesh else 5
 	if (mesh_buffer["main_element_count"] != mesh_buffer["element_count"] or
-			mesh_buffer["element_count"] < 5 or mesh_buffer["element_count"] > 7):
+			mesh_buffer["element_count"] < minimum_elements or mesh_buffer["element_count"] > 7):
 		raise MeshProfileError("structural-profile-mismatch:vertex-element-count")
 	def readVertexElements(source, offset, count, label):
 		_checkedRange(source, offset, count * 8, label)
@@ -1205,7 +1616,9 @@ def _parsePragmataMeshData(data, header, streaming_data=None):
 	main_vertex_elements, element_types = readVertexElements(
 		data, mesh_buffer["vertex_element_offset"], mesh_buffer["element_count"],
 		"vertex-elements")
-	if (not {0, 1, 2, 4, 5}.issubset(main_vertex_elements) or
+	required_elements = {0, 1, 2, 5} if static_mesh else {0, 1, 2, 4, 5}
+	if (not required_elements.issubset(main_vertex_elements) or
+			(static_mesh and any(element in main_vertex_elements for element in (4, 7))) or
 			any(element_type not in (0, 1, 2, 3, 4, 5, 7) for element_type in element_types) or
 			element_types != sorted(element_types)):
 		raise MeshProfileError("structural-profile-mismatch:vertex-elements")
@@ -1215,11 +1628,26 @@ def _parsePragmataMeshData(data, header, streaming_data=None):
 			raise MeshProfileError("structural-profile-mismatch:vertex-stride")
 
 	main_vertex_count = buffer_vertex_counts["main"]
-	streaming_vertex_count = buffer_vertex_counts["streaming"]
-	streaming_layout = None
-	if streaming_entry_count:
+	streaming_layouts = {}
+	stream_buffer_ranges = []
+	if multi_stream:
+		descriptor_start = mesh_buffer["streaming_vertex_element_offset"]
+		descriptor_stride = (mesh_buffer["main_element_count"] * 8 + 15) & ~15
+		descriptor_range = _checkedRange(data, descriptor_start,
+			descriptor_stride + mesh_buffer["main_element_count"] * 8,
+			"streaming-descriptors")
+		protected_ranges = (
+			(header["mesh_offset"], header["streaming_offset"] + 16),
+			(mesh_buffer["vertex_element_offset"],
+			 mesh_buffer["vertex_element_offset"] + mesh_buffer["element_count"] * 8),
+			mesh_buffer["total_buffer_range"],
+		)
+		if any(_rangesOverlap(descriptor_range, protected) for protected in protected_ranges):
+			raise MeshProfileError("range-overlap:streaming-descriptors")
+	for stream_index in range(streaming_entry_count):
+		stream_kind = "streaming" if stream_index == 0 else "streaming_1"
 		stream_header_format = "<QIIHHQQ" + "I" * 11
-		stream_header_offset = header["mesh_offset"] + 96
+		stream_header_offset = header["mesh_offset"] + 96 + stream_index * struct.calcsize(stream_header_format)
 		_checkedRange(data, stream_header_offset, struct.calcsize(stream_header_format),
 			"streaming-buffer-header")
 		stream_values = struct.unpack_from(stream_header_format, data, stream_header_offset)
@@ -1233,23 +1661,28 @@ def _parsePragmataMeshData(data, header, streaming_data=None):
 			raise MeshProfileError("structural-profile-mismatch:streaming-vertex-element-count")
 		stream_info_count, _stream_info_unknown, stream_info_entry_offset = struct.unpack_from(
 			"<IIQ", data, header["streaming_offset"])
-		if stream_info_count != 1:
+		if stream_info_count != streaming_entry_count:
 			raise MeshProfileError("unsupported-streaming-entry-count")
+		stream_info_entry_offset += stream_index * 8
 		_checkedRange(data, stream_info_entry_offset, 8, "streaming-info-entry")
 		stream_buffer_start, stream_buffer_length = struct.unpack_from(
 			"<II", data, stream_info_entry_offset)
 		if stream_buffer_length != stream_total_size:
 			raise MeshProfileError("structural-profile-mismatch:streaming-buffer-size")
-		_checkedRange(streaming_data, stream_buffer_start, stream_total_size,
+		stream_range = _checkedRange(streaming_data, stream_buffer_start, stream_total_size,
 			"streaming-buffer")
+		if any(_rangesOverlap(stream_range, previous) for previous in stream_buffer_ranges):
+			raise MeshProfileError("range-overlap:streaming-buffer")
+		stream_buffer_ranges.append(stream_range)
 		if stream_unpadded_size < stream_vertex_size or stream_unpadded_size > stream_total_size:
 			raise MeshProfileError("structural-profile-mismatch:streaming-buffer-size")
 		stream_vertex_elements, stream_element_types = readVertexElements(
-			data, mesh_buffer["streaming_vertex_element_offset"],
+			data, mesh_buffer["streaming_vertex_element_offset"] +
+			stream_index * ((mesh_buffer["main_element_count"] * 8 + 15) & ~15),
 			mesh_buffer["main_element_count"], "streaming-vertex-elements")
 		if stream_element_types != element_types:
 			raise MeshProfileError("structural-profile-mismatch:streaming-vertex-elements")
-		streaming_layout = {
+		streaming_layouts[stream_kind] = {
 			"buffer_start": stream_buffer_start,
 			"vertex_size": stream_vertex_size,
 			"face_start": stream_buffer_start + stream_vertex_size,
@@ -1261,7 +1694,7 @@ def _parsePragmataMeshData(data, header, streaming_data=None):
 	vertex_elements = {}
 	combined_offset = 0
 	main_element_ranges = []
-	streaming_element_ranges = []
+	streaming_element_ranges = {kind: [] for kind in streaming_layouts}
 	for element_type in element_types:
 		main_element = main_vertex_elements[element_type]
 		main_size = main_element["stride"] * main_vertex_count
@@ -1280,7 +1713,11 @@ def _parsePragmataMeshData(data, header, streaming_data=None):
 			"type": element_type, "stride": main_element["stride"],
 			"offset": combined_offset,
 		}
-		if streaming_layout is not None:
+		for stream_kind in buffer_order[:-1]:
+			if stream_kind not in streaming_layouts:
+				continue
+			streaming_layout = streaming_layouts[stream_kind]
+			streaming_vertex_count = buffer_vertex_counts[stream_kind]
 			stream_element = streaming_layout["elements"][element_type]
 			if stream_element["stride"] != main_element["stride"]:
 				raise MeshProfileError("structural-profile-mismatch:streaming-vertex-stride")
@@ -1292,13 +1729,13 @@ def _parsePragmataMeshData(data, header, streaming_data=None):
 				"streaming-vertex-element-" + str(element_type))
 			stream_range = (
 				stream_element["offset"], stream_element["offset"] + stream_size)
-			for previous_type, previous_range in streaming_element_ranges:
+			for previous_type, previous_range in streaming_element_ranges[stream_kind]:
 				if stream_size and _rangesOverlap(stream_range, previous_range):
 					raise MeshProfileError(
 						"range-overlap:streaming-vertex-element-" +
 						str(previous_type) + ":streaming-vertex-element-" +
 						str(element_type))
-			streaming_element_ranges.append((element_type, stream_range))
+			streaming_element_ranges[stream_kind].append((element_type, stream_range))
 			vertex_buffer_parts.append(bytes(streaming_data[stream_start:stream_start + stream_size]))
 			combined_offset += stream_size
 		vertex_buffer_parts.append(bytes(data[main_start:main_start + main_size]))
@@ -1313,17 +1750,22 @@ def _parsePragmataMeshData(data, header, streaming_data=None):
 			raise MeshProfileError("structural-profile-mismatch:non-finite-position")
 		positions.append(position)
 
-	weight_start = vertex_elements[4]["offset"]
-	weight_size = vertex_elements[4]["stride"] * vertex_count
-	weight_data = vertex_buffer[weight_start:weight_start + weight_size]
-	extra_weight_data = None
-	if 7 in vertex_elements:
-		extra_weight_start = vertex_elements[7]["offset"]
-		extra_weight_size = vertex_elements[7]["stride"] * vertex_count
-		extra_weight_data = vertex_buffer[
-			extra_weight_start:extra_weight_start + extra_weight_size]
-	bone_indices, bone_weights, weight_stats = _decodePragmataWeightProfile(
-		weight_data, extra_weight_data, bone_map_count)
+	if static_mesh:
+		bone_indices, bone_weights = [], []
+		weight_stats = {key: 0 for key in ("weighted_bone_count",
+			"weighted_vertex_count", "max_influences", "weight_sum_max_error")}
+	else:
+		weight_start = vertex_elements[4]["offset"]
+		weight_size = vertex_elements[4]["stride"] * vertex_count
+		weight_data = vertex_buffer[weight_start:weight_start + weight_size]
+		extra_weight_data = None
+		if 7 in vertex_elements:
+			extra_weight_start = vertex_elements[7]["offset"]
+			extra_weight_size = vertex_elements[7]["stride"] * vertex_count
+			extra_weight_data = vertex_buffer[
+				extra_weight_start:extra_weight_start + extra_weight_size]
+		bone_indices, bone_weights, weight_stats = _decodePragmataWeightProfile(
+			weight_data, extra_weight_data, bone_map_count)
 
 	face_buffer_size = mesh_buffer["face_buffer_size"]
 	if face_buffer_size % 2:
@@ -1331,13 +1773,13 @@ def _parsePragmataMeshData(data, header, streaming_data=None):
 	face_sources = {
 		"main": (data, mesh_buffer["face_buffer_offset"], face_buffer_size),
 	}
-	if streaming_layout is not None:
+	for stream_kind, streaming_layout in streaming_layouts.items():
 		if streaming_layout["face_size"] % 2:
 			raise MeshProfileError("structural-profile-mismatch:streaming-face-buffer-size")
-		face_sources["streaming"] = (
+		face_sources[stream_kind] = (
 			streaming_data, streaming_layout["face_start"], streaming_layout["face_size"])
 	indices = []
-	index_ranges = {"main": [], "streaming": []}
+	index_ranges = {kind: [] for kind in buffer_order}
 	for submesh in submeshes:
 		if submesh["index_count"] % 3:
 			raise MeshProfileError("structural-profile-mismatch:index-count")
@@ -1401,3 +1843,285 @@ def _parsePragmataMeshData(data, header, streaming_data=None):
 		"blend_shape_names": blend_shape_names,
 		"blend_shapes": blend_shapes,
 	}
+
+def parseWildsMeshData(data, header, streaming_data=None):
+	"""Normalize observed Wilds base-geometry layouts for shared submission.
+
+	Byte contracts and independent oracles: RE-090 phase1 mesh-layout.json.
+	Blend names are metadata only; packed blend payload is deliberately not decoded.
+	"""
+	if header.get("capability") != WILDS_240704828:
+		raise MeshProfileError("unsupported-mesh-profile")
+	regions = [(0, 176)]
+	def metadata(offset, size, label):
+		region = _checkedRange(data, offset, size, label)
+		if region in regions:
+			return region
+		if any(_rangesOverlap(region, previous) for previous in regions):
+			raise MeshProfileError("range-overlap:" + label)
+		regions.append(region)
+		return region
+	def unpack(offset, fmt, label):
+		_checkedRange(data, offset, struct.calcsize(fmt), label)
+		return struct.unpack_from(fmt, data, offset)
+
+	lod_offset = header["lod_offset"]
+	metadata(lod_offset, 64, "lod-header")
+	lod_count, material_count = unpack(lod_offset, "<BB", "lod-counts")
+	stream_count = header["streaming_entry_count"]
+	if not 1 <= lod_count <= 64 or not material_count or data[lod_offset + 6] != 0:
+		raise MeshProfileError("structural-profile-mismatch:lod-header")
+	if stream_count and (lod_count != stream_count + 1 or streaming_data is None):
+		raise MeshProfileError("missing-streaming-companion-or-unsupported-lods")
+	metadata(lod_offset + 64, lod_count * 8, "lod-table")
+	metadata(header["names_offset"], header["name_count"] * 8, "names-table")
+	names = []
+	string_offsets = set()
+	for index in range(header["name_count"]):
+		offset = unpack(header["names_offset"] + index * 8, "<Q", "name-pointer")[0]
+		name = _readPragmataCString(data, offset, "name-string")
+		if not name:
+			raise MeshProfileError("structural-profile-mismatch:empty-name")
+		if offset not in string_offsets:
+			metadata(offset, len(name.encode("utf-8")) + 1, "name-string")
+			string_offsets.add(offset)
+		names.append(name)
+	def remap(offset, count, label):
+		metadata(offset, count * 2, label)
+		result = []
+		for index in range(count):
+			slot = unpack(offset + index * 2, "<H", label)[0]
+			if slot >= len(names):
+				raise MeshProfileError("name-index-out-of-range:" + label)
+			result.append(names[slot])
+		return result
+	material_names = remap(header["material_remap_offset"], material_count, "material-remap")
+	bones, bone_map = [], []
+	if header["skeleton_offset"]:
+		offset = header["skeleton_offset"]
+		bone_count, map_count = unpack(offset, "<II", "skeleton-counts")
+		_validatePragmataBoneMapCount(map_count)
+		metadata(offset, 48 + map_count * 2, "skeleton-header-map")
+		pointers = unpack(offset + 16, "<4Q", "skeleton-pointers")
+		for index, pointer in enumerate(pointers):
+			metadata(pointer, bone_count * (16 if index == 0 else 64), "skeleton-table")
+		metadata(header["bone_remap_offset"], bone_count * 2, "bone-remap")
+		bone_count, map_count, bone_map, bones = _readProfileSkeleton(
+			data, offset, header["bone_remap_offset"], names)
+		for index, bone in enumerate(bones):
+			if bone["index"] != index:
+				raise MeshProfileError("structural-profile-mismatch:bone-index-order")
+			seen = set()
+			parent = index
+			while parent != -1:
+				if parent in seen:
+					raise MeshProfileError("bone-parent-cycle")
+				seen.add(parent)
+				parent = bones[parent]["parent_index"]
+		for pointer in pointers[2:]:
+			for value in struct.unpack_from("<" + str(bone_count * 16) + "f", data, pointer):
+				if not math.isfinite(value):
+					raise MeshProfileError("non-finite-bone-matrix")
+	elif header["bone_remap_offset"]:
+		raise MeshProfileError("structural-profile-mismatch:bone-remap-without-skeleton")
+	blend_shape_names = []
+	remaining_names = len(names) - material_count - len(bones)
+	if remaining_names:
+		if remaining_names < 0 or not header["blend_shape_offset"] or not header["blend_name_offset"]:
+			raise MeshProfileError("structural-profile-mismatch:blend-names")
+		blend_shape_names = remap(header["blend_name_offset"], remaining_names, "blend-name-remap")
+
+	mesh_offset = header["mesh_offset"]
+	metadata(mesh_offset, 64 + stream_count * 64, "mesh-buffer-header")
+	values = unpack(mesh_offset, "<QQQIIHH7I", "main-buffer")
+	elements, start, total, vertex_size, count = values[0], values[1], values[3], values[4], values[6]
+	if start != header["vertices_offset"] or values[5] != count or not 3 <= count <= 7:
+		raise MeshProfileError("structural-profile-mismatch:main-buffer")
+	if values[7] != values[8]:
+		raise MeshProfileError("structural-profile-mismatch:unpadded-size")
+	metadata(header["streaming_offset"], 16, "streaming-info")
+	buffers = [{"source": data, "start": start, "total": total, "vertex_size": vertex_size,
+		"unpadded": values[7], "elements_offset": elements}]
+	if stream_count:
+		entries = header["streaming_entries_offset"]
+		metadata(entries, stream_count * 8, "streaming-entries")
+		end = 0
+		seen_ranges = set()
+		for index in range(stream_count):
+			start, length = unpack(entries + index * 8, "<II", "streaming-range")
+			stream_elements, range_start = unpack(mesh_offset + 64 + index * 64,
+				"<QQ", "streaming-element-pointer")
+			values = unpack(mesh_offset + 80 + index * 64, "<QIIHH7I", "streaming-buffer")
+			if ((start != end and (start, length) not in seen_ranges) or
+					range_start != start or length != values[1] or values[3] != count or
+					values[4] != count or values[5] != values[6]):
+				raise MeshProfileError("structural-profile-mismatch:streaming-buffer")
+			seen_ranges.add((start, length))
+			end = max(end, start + length)
+			buffers.append({"source": streaming_data, "start": start, "total": length,
+				"vertex_size": values[2], "unpadded": values[5],
+				"elements_offset": stream_elements})
+		if end != len(streaming_data):
+			raise MeshProfileError("structural-profile-mismatch:streaming-buffer-size")
+	expected_types = None
+	strides = {0: 12, 1: 8, 2: 4, 3: 4, 4: 16, 5: 4, 7: 16}
+	element_tables = set()
+	for buffer in buffers:
+		if not 0 < buffer["vertex_size"] < buffer["unpadded"] <= buffer["total"]:
+			raise MeshProfileError("structural-profile-mismatch:buffer-size")
+		if (buffer["unpadded"] - buffer["vertex_size"]) % 2:
+			raise MeshProfileError("structural-profile-mismatch:face-buffer-size")
+		_checkedRange(buffer["source"], buffer["start"], buffer["total"], "geometry-buffer")
+		if buffer["elements_offset"] not in element_tables:
+			metadata(buffer["elements_offset"], count * 8, "vertex-elements")
+			element_tables.add(buffer["elements_offset"])
+		element_map = {}
+		element_types = []
+		for index in range(count):
+			typ, stride, offset = unpack(buffer["elements_offset"] + index * 8, "<HHI", "vertex-element")
+			if typ not in strides or typ in element_map or stride != strides[typ]:
+				raise MeshProfileError("structural-profile-mismatch:vertex-elements")
+			element_map[typ] = {"type": typ, "stride": stride, "offset": offset}
+			element_types.append(typ)
+		if (element_types != sorted(element_types) or
+				not {0, 1, 2}.issubset(element_map) or
+				bool(bones) != (4 in element_map) or
+				(7 in element_map and 4 not in element_map)):
+			raise MeshProfileError("structural-profile-mismatch:vertex-elements")
+		if expected_types is None:
+			expected_types = element_types
+		elif element_types != expected_types:
+			raise MeshProfileError("structural-profile-mismatch:streaming-vertex-elements")
+		buffer.update(elements=element_map, vertex_count=0, index_ranges=[])
+
+	groups, submeshes = [], []
+	vertex_count = 0
+	for li in range(lod_count):
+		record = unpack(lod_offset + 64 + li * 8, "<Q", "lod-pointer")[0]
+		metadata(record, 16, "lod-record")
+		group_count = data[record]
+		if not group_count:
+			raise MeshProfileError("structural-profile-mismatch:group-count")
+		table = unpack(record + 8, "<Q", "group-table-pointer")[0]
+		metadata(table, group_count * 8, "group-table")
+		lod_slot_counts = {}
+		for gi in range(group_count):
+			offset = unpack(table + gi * 8, "<Q", "group-pointer")[0]
+			gid, sn, unused, unused2, vc, ic = unpack(offset, "<BBHIII", "group")
+			if not sn or not vc or not ic:
+				raise MeshProfileError("structural-profile-mismatch:empty-group")
+			metadata(offset, 16 + sn * 32, "group-submeshes")
+			rows = [parsePragmataSubmesh(data, offset + 16 + si * 32) for si in range(sn)]
+			slots = {data[offset + 16 + si * 32 + 2] for si in range(sn)}
+			if len(slots) != 1:
+				raise MeshProfileError("structural-profile-mismatch:submesh-buffer")
+			slot = slots.pop()
+			if slot > stream_count:
+				raise MeshProfileError("structural-profile-mismatch:submesh-buffer")
+			buffer = buffers[slot]
+			local_start = lod_slot_counts.get(slot, 0)
+			if rows[0]["vertex_start"] != local_start:
+				raise MeshProfileError("structural-profile-mismatch:vertex-start")
+			first_index = rows[0]["index_start"]
+			if sum(row["index_count"] for row in rows) > ic:
+				raise MeshProfileError("structural-profile-mismatch:group-index-count")
+			groups.append({"lod_index": li, "group_index": gi, "group_id": gid,
+				"vertex_start": vertex_count, "vertex_count": vc, "index_count": ic})
+			for si, row in enumerate(rows):
+				end = rows[si + 1]["vertex_start"] if si + 1 < sn else local_start + vc
+				if (data[offset + 16 + si * 32 + 2] != slot or row["streaming_offset"] or
+						row["platform_streaming_offset"] or row["material_index"] >= material_count):
+					raise MeshProfileError("structural-profile-mismatch:submesh")
+				if not row["vertex_start"] < end <= local_start + vc:
+					raise MeshProfileError("structural-profile-mismatch:vertex-start")
+				if (not row["index_count"] or row["index_count"] % 3 or
+						row["index_start"] < first_index or row["index_start"] + row["index_count"] > first_index + ic):
+					raise MeshProfileError("structural-profile-mismatch:index-count")
+				row.update(lod_index=li, group_index=gi, group_id=gid, submesh_index=si,
+					buffer_kind=slot, local_vertex_start=row["vertex_start"],
+					vertex_count=end-row["vertex_start"])
+				row["vertex_start"] = vertex_count + row["local_vertex_start"] - local_start
+				submeshes.append(row)
+			lod_slot_counts[slot] = local_start + vc
+			vertex_count += vc
+		for slot, count_for_slot in lod_slot_counts.items():
+			buffer = buffers[slot]
+			if buffer["vertex_count"] not in (0, count_for_slot):
+				raise MeshProfileError("structural-profile-mismatch:buffer-vertex-count")
+			buffer["vertex_count"] = count_for_slot
+
+	parts, vertex_elements, combined_offset = [], {}, 0
+	for buffer in buffers:
+		ranges = []
+		for typ in expected_types:
+			element = buffer["elements"][typ]
+			size = element["stride"] * buffer["vertex_count"]
+			region = (element["offset"], element["offset"] + size)
+			if region[1] > buffer["vertex_size"]:
+				raise MeshProfileError("offset-out-of-bounds:vertex-element")
+			if any(_rangesOverlap(region, previous) for previous in ranges):
+				raise MeshProfileError("range-overlap:vertex-element")
+			ranges.append(region)
+	main_region = (buffers[0]["start"], buffers[0]["start"] + buffers[0]["total"])
+	if any(_rangesOverlap(main_region, previous) for previous in regions):
+		raise MeshProfileError("range-overlap:main-buffer-metadata")
+	for typ in expected_types:
+		vertex_elements[typ] = {"type": typ, "stride": strides[typ], "offset": combined_offset}
+		for row in submeshes:
+			buffer = buffers[row["buffer_kind"]]
+			start = buffer["start"] + buffer["elements"][typ]["offset"] + row["local_vertex_start"] * strides[typ]
+			size = row["vertex_count"] * strides[typ]
+			parts.append(bytes(buffer["source"][start:start + size]))
+			combined_offset += size
+	vertex_buffer = b"".join(parts)
+	positions = [struct.unpack_from("<3f", vertex_buffer, i * 12) for i in range(vertex_count)]
+	if any(not math.isfinite(c) for position in positions for c in position):
+		raise MeshProfileError("structural-profile-mismatch:non-finite-position")
+	indices = []
+	for row in submeshes:
+		buffer = buffers[row["buffer_kind"]]
+		start = row["index_start"] * 2
+		size = row["index_count"] * 2
+		if start + size > buffer["unpadded"] - buffer["vertex_size"]:
+			raise MeshProfileError("offset-out-of-bounds:index-buffer")
+		region = (start, start + size)
+		if (region not in buffer["index_ranges"] and
+				any(_rangesOverlap(region, previous) for previous in buffer["index_ranges"])):
+			raise MeshProfileError("range-overlap:index-buffer")
+		if region not in buffer["index_ranges"]:
+			buffer["index_ranges"].append(region)
+		start += buffer["start"] + buffer["vertex_size"]
+		row["index_buffer"] = bytes(buffer["source"][start:start + size])
+		row["indices"] = list(struct.unpack("<" + str(row["index_count"]) + "H", row["index_buffer"]))
+		if any(index >= row["vertex_count"] for index in row["indices"]):
+			raise MeshProfileError("index-out-of-range")
+		indices.extend(index + row["vertex_start"] for index in row["indices"])
+	bone_indices, bone_weights = [], []
+	stats = _newPragmataImportStats(WILDS_240704828)
+	if bones:
+		start = vertex_elements[4]["offset"]
+		extra_weights = None
+		if 7 in vertex_elements:
+			extra_start = vertex_elements[7]["offset"]
+			extra_weights = vertex_buffer[
+				extra_start:extra_start + vertex_count * 16]
+		bone_indices, bone_weights, weights = _decodePragmataWeightProfile(
+			vertex_buffer[start:start + vertex_count * 16], extra_weights,
+			len(bone_map))
+		if any(sum(row) != 255 for row in bone_weights):
+			raise MeshProfileError("structural-profile-mismatch:weight-sum")
+		stats.update(weights)
+	stats.update(lod_count=lod_count, group_count=len(groups), submesh_count=len(submeshes),
+		vertex_count=vertex_count, index_count=len(indices), triangle_count=len(indices)//3,
+		normal_count=vertex_count, tangent_count=vertex_count, uv_count=vertex_count,
+		color_count=vertex_count if 5 in vertex_elements else 0, bone_count=len(bones),
+		material_binding_count=len(submeshes),
+		aabb={"min": [min(p[a] for p in positions) for a in range(3)],
+			"max": [max(p[a] for p in positions) for a in range(3)]},
+		topology_hash=_meshTopologyHash(positions, indices))
+	return {"stats": stats, "positions": positions, "indices": indices,
+		"groups": groups, "submeshes": submeshes, "vertex_buffer": vertex_buffer,
+		"vertex_elements": vertex_elements, "bone_indices": bone_indices,
+		"bone_weights": bone_weights, "bone_map": bone_map, "bones": bones,
+		"material_names": material_names, "blend_shape_names": blend_shape_names,
+		"blend_shapes": []}

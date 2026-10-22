@@ -182,18 +182,31 @@ def topology_hash(positions, indices, error_type=ValueError):
 	if len(indices) % 3:
 		raise error_type("structural-profile-mismatch:index-count")
 	triangles = []
+	canonical_positions = [None] * len(positions)
 	for start in range(0, len(indices), 3):
 		triangle = []
 		for index in indices[start:start + 3]:
 			if index < 0 or index >= len(positions):
 				raise error_type("index-out-of-range")
-			rounded = [round(float(value), 6) for value in positions[index]]
-			if any(not math.isfinite(value) for value in rounded):
-				raise error_type(
-					"structural-profile-mismatch:non-finite-position")
-			triangle.append([0.0 if value == 0.0 else value for value in rounded])
-		triangles.append(sorted(triangle))
-	payload = json.dumps(sorted(triangles), sort_keys=True, separators=(",", ":"))
-	return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+			if canonical_positions[index] is None:
+				rounded = [round(float(value), 6) for value in positions[index]]
+				if any(not math.isfinite(value) for value in rounded):
+					raise error_type(
+						"structural-profile-mismatch:non-finite-position")
+				canonical_positions[index] = tuple(
+					0.0 if value == 0.0 else value for value in rounded)
+			triangle.append(canonical_positions[index])
+		triangles.append(tuple(sorted(triangle)))
+	triangles.sort()
+	# Preserve the canonical JSON bytes without materializing the whole string
+	# and its UTF-8 copy, which exceed the 32-bit host limit on large meshes.
+	digest = hashlib.sha256(b"[")
+	for start in range(0, len(triangles), 1024):
+		if start:
+			digest.update(b",")
+		chunk = json.dumps(triangles[start:start + 1024], separators=(",", ":"))
+		digest.update(chunk[1:-1].encode("utf-8"))
+	digest.update(b"]")
+	return digest.hexdigest()
 
 
